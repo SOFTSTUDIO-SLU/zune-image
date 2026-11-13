@@ -595,6 +595,32 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 }
             }
 
+            // The scan ran out of data in this MCU: it used zero bits padded in after a marker.
+            // Checked before a restart marker resets the stream.
+            if stream.padding_consumed() {
+                if self.options.strict_mode() {
+                    return Err(DecodeErrors::FormatStatic("Premature end of buffer"));
+                }
+                if !PROGRESSIVE {
+                    // As libjpeg does: this MCU stays as decoded, and the MCUs after it have
+                    // all coefficients zero, samples 128. Counted as an over-read, so that the
+                    // next row's check fills the rest of the image with 128 and stops. (A scan
+                    // that holds only some components is assembled at the end; for it only
+                    // strict mode changes.)
+                    error!("Premature end of buffer");
+                    for component in self.components.iter_mut().filter(|c| c.needed && c.width_stride > 0) {
+                        let start = (j + 1) * component.horizontal_sample * 8;
+                        for line in component.raw_coeff.chunks_exact_mut(component.width_stride) {
+                            if let Some(rest) = line.get_mut(start..) {
+                                rest.fill(128);
+                            }
+                        }
+                    }
+                    stream.overread_by = stream.overread_by.max(1);
+                    break;
+                }
+            }
+
             self.todo = self.todo.wrapping_sub(1);
 
             if self.todo == 0 {

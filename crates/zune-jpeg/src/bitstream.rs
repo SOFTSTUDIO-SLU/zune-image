@@ -130,6 +130,10 @@ pub(crate) struct BitStream {
     /// True if we have seen end of image marker.
     /// Don't read anything after that.
     pub seen_eoi:            bool,
+    /// Zero bits appended to the buffer after a marker (or EOI) ended the entropy-coded
+    /// data, since the last reset. They come after every real bit, so the decoder has used
+    /// some of them once fewer bits than this are left; see `padding_consumed`.
+    padded_bits:             usize,
 }
 
 impl BitStream {
@@ -147,6 +151,7 @@ impl BitStream {
             eob_run:             0,
             overread_by:         0,
             seen_eoi:            false,
+            padded_bits:         0,
         }
     }
 
@@ -165,6 +170,7 @@ impl BitStream {
             eob_run:             0,
             overread_by:         0,
             seen_eoi:            false,
+            padded_bits:         0,
         }
     }
 
@@ -227,6 +233,7 @@ impl BitStream {
                                 // removes some panics
                                 self.buffer <<= 8;
                                 self.bits_left += 8;
+                                self.padded_bits += 8;
                                 self.aligned_buffer = self.buffer << (64 - self.bits_left);
                             }
 
@@ -246,6 +253,7 @@ impl BitStream {
                 // fill with zeroes
                 self.buffer <<= 32;
                 self.bits_left += 32;
+                self.padded_bits += 32;
                 self.aligned_buffer = self.buffer << (64 - self.bits_left);
                 return Ok(true);
             }
@@ -767,6 +775,15 @@ impl BitStream {
         self.spec_end = spec_end;
     }
 
+    /// Whether the decoder has used zero bits that `refill` appended after a marker ended the
+    /// entropy-coded data: the segment ran out of data before its last MCU.
+    ///
+    /// The encoder completes the last byte of a segment with fill bits, so decoding a whole
+    /// segment never needs a bit past that byte.
+    pub(crate) const fn padding_consumed(&self) -> bool {
+        self.padded_bits > self.bits_left as usize
+    }
+
     /// Reset the stream if we have a restart marker
     ///
     /// Restart markers indicate drop those bits in the stream and zero out
@@ -774,6 +791,7 @@ impl BitStream {
     #[cold]
     pub fn reset(&mut self) {
         self.bits_left = 0;
+        self.padded_bits = 0;
         self.marker = None;
         self.buffer = 0;
         self.aligned_buffer = 0;
