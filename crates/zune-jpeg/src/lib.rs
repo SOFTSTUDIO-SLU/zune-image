@@ -170,7 +170,7 @@ extern crate core;
 pub use zune_core;
 
 pub use crate::components::SampleRatios;
-pub use crate::decoder::{ImageInfo, JpegDecoder};
+pub use crate::decoder::{ColorTransform, ImageInfo, JpegDecoder};
 pub use crate::marker::Marker;
 mod bitstream;
 mod color_convert;

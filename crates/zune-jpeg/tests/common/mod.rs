@@ -17,6 +17,8 @@
 
 #![allow(dead_code)]
 
+pub mod color;
+
 /// A grey image of `width` × `height` samples with one value per block, blocks in row order.
 pub struct Gray {
     pub width:   u16,

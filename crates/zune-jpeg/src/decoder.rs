@@ -28,7 +28,7 @@ use crate::headers::{
 use crate::huffman::HuffmanTable;
 use crate::idct::{choose_idct_func, choose_idct_1x1_func, choose_idct_4x4_func};
 use crate::marker::Marker;
-use crate::misc::{try_zeroed_vec, SOFMarkers};
+use crate::misc::{settle_input_colorspace, try_zeroed_vec, SOFMarkers};
 use crate::upsampler::{
     choose_horizontal_samp_function, choose_hv_samp_function, choose_v_samp_function,
     generic_sampler, upsample_no_op
@@ -163,6 +163,46 @@ pub struct JpegDecoder<T> {
     pub(crate) skip_before_soi: bool,
     /// The bytes skipped before SOI, see [`JpegDecoder::bytes_before_soi`]
     pub(crate) bytes_before_soi: usize,
+    /// The transform byte of the last Adobe APP14 segment, see [`JpegDecoder::adobe_transform`]
+    pub(crate) adobe_transform: Option<u8>,
+    /// The caller's colour transform, see [`JpegDecoder::set_color_transform`]
+    pub(crate) color_transform: Option<ColorTransform>,
+}
+
+/// How the samples of a frame map to colours, chosen by the caller (see
+/// [`JpegDecoder::set_color_transform`]) instead of the decoder's own rules
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorTransform {
+    /// The samples are the colours as stored: no transform. The input colour space is
+    /// `Luma` for one component, `RGB` for three, `CMYK` for four, and `MultiBand` otherwise.
+    None,
+    /// Three components are YCbCr, to be transformed to RGB (input colour space `YCbCr`).
+    YCbCrToRgb,
+    /// Four components are YCbCr and K (YCCK), to be transformed to CMYK (input colour
+    /// space `YCCK`).
+    YcckToCmyk
+}
+
+impl ColorTransform {
+    /// The input colour space of a frame of `components` components under this transform, or
+    /// an error when the transform does not apply to that many components.
+    pub(crate) fn input_colorspace(self, components: usize) -> Result<ColorSpace, DecodeErrors> {
+        match (self, components) {
+            (Self::None, 1) => Ok(ColorSpace::Luma),
+            (Self::None, 3) => Ok(ColorSpace::RGB),
+            (Self::None, 4) => Ok(ColorSpace::CMYK),
+            (Self::None, n) => u32::try_from(n)
+                .ok()
+                .and_then(core::num::NonZeroU32::new)
+                .map(ColorSpace::MultiBand)
+                .ok_or(DecodeErrors::FormatStatic("No components")),
+            (Self::YCbCrToRgb, 3) => Ok(ColorSpace::YCbCr),
+            (Self::YcckToCmyk, 4) => Ok(ColorSpace::YCCK),
+            (transform, n) => Err(DecodeErrors::Format(format!(
+                "Colour transform {transform:?} does not apply to {n} components"
+            )))
+        }
+    }
 }
 
 impl<T> JpegDecoder<T>
@@ -212,6 +252,8 @@ where
             max_memory:        None,
             skip_before_soi:   false,
             bytes_before_soi:  0,
+            adobe_transform:   None,
+            color_transform:   None,
         }
     }
     /// Decode a buffer already in memory
@@ -272,6 +314,45 @@ where
     #[must_use]
     pub const fn bytes_before_soi(&self) -> usize {
         self.bytes_before_soi
+    }
+
+    /// The transform byte of the Adobe APP14 segment (0, 1 or 2), when the headers had one
+    /// (the last one, if there were several); `None` when they had none, or have not been
+    /// decoded
+    ///
+    /// Adobe's marker says whether the encoder transformed the colours: 0 for none, 1 for
+    /// YCbCr, 2 for YCCK.
+    #[must_use]
+    pub const fn adobe_transform(&self) -> Option<u8> {
+        if self.headers_decoded {
+            self.adobe_transform
+        } else {
+            None
+        }
+    }
+
+    /// Choose how the samples map to colours, or `None` for the decoder's own rules (the
+    /// default)
+    ///
+    /// The decoder's rules look at the Adobe APP14 marker, the component identifiers and the
+    /// component count. A caller whose format has its own rules (PDF's `ColorTransform`, say)
+    /// sets the transform instead, and the decoder then uses it and nothing else:
+    /// [`input_colorspace`](Self::input_colorspace) after the headers is the transform's input
+    /// colour space ([`ColorTransform`]), and the output is converted from it to the output
+    /// colour space of the options as usual. Ask for the input colour space itself to get the
+    /// samples as stored, for `RGB` from [`ColorTransform::YCbCrToRgb`] and for `CMYK` from
+    /// [`ColorTransform::YcckToCmyk`].
+    ///
+    /// Decoding the headers fails with [`DecodeErrors::Format`] when the transform does not
+    /// apply to the frame's component count.
+    pub fn set_color_transform(&mut self, transform: Option<ColorTransform>) {
+        self.color_transform = transform;
+    }
+
+    /// The transform set with [`set_color_transform`](Self::set_color_transform), if any
+    #[must_use]
+    pub const fn color_transform(&self) -> Option<ColorTransform> {
+        self.color_transform
     }
 
     /// Skips to the first SOI marker that is followed by another marker, where the data does
@@ -470,6 +551,11 @@ where
     /// This indicates the colorspace that is present in
     /// the image, but this may be different to the colorspace that
     /// the output will be transformed to
+    ///
+    /// Once the headers are decoded this is the colour space the decode converts from: the
+    /// decoder's rules are settled by then (an Adobe transform of 0 with three components is
+    /// `RGB`, a colour space with more components than the frame is adjusted to the frame),
+    /// or it follows the caller's [`ColorTransform`].
     ///
     /// # Returns
     /// -`Some(Colorspace)`: Input colorspace
@@ -685,6 +771,8 @@ where
                         if is_rgb {
                             self.input_colorspace = ColorSpace::RGB;
                         }
+                        // The colour space the decode will use, so that callers see it.
+                        settle_input_colorspace(self)?;
 
                         return Ok(());
                     }
