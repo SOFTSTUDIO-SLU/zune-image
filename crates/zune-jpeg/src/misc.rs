@@ -188,10 +188,6 @@ impl fmt::Debug for SOFMarkers {
     }
 }
 
-/// Set up component parameters.
-///
-/// This modifies the components in place setting up details needed by other
-/// parts fo the decoder.
 /// A vector of `len` zeros, or [`DecodeErrors::OutOfMemory`] when the allocator refuses it (where
 /// `vec!` would abort the process).
 pub(crate) fn try_zeroed_vec<T: Copy + Default>(len: usize) -> Result<Vec<T>, DecodeErrors> {
@@ -202,6 +198,10 @@ pub(crate) fn try_zeroed_vec<T: Copy + Default>(len: usize) -> Result<Vec<T>, De
     Ok(v)
 }
 
+/// Set up component parameters.
+///
+/// This modifies the components in place setting up details needed by other
+/// parts fo the decoder.
 pub(crate) fn setup_component_params<T: ZByteReaderTrait>(
     img: &mut JpegDecoder<T>
 ) -> Result<(), DecodeErrors> {
