@@ -21,7 +21,7 @@ use crate::decoder::MAX_COMPONENTS;
 use crate::errors::DecodeErrors;
 use crate::marker::Marker;
 use crate::mcu_prog::get_marker;
-use crate::misc::{calculate_padded_width, setup_component_params};
+use crate::misc::{calculate_padded_width, setup_component_params, try_zeroed_vec};
 use crate::worker::{color_convert, upsample};
 use crate::JpegDecoder;
 
@@ -180,7 +180,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     * component.horizontal_sample
                     * mcu_height
                     * 64;
-                *mcu = vec![0; len];
+                *mcu = try_zeroed_vec(len)?;
             }
         }
 

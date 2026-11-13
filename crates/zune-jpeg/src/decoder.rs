@@ -28,7 +28,7 @@ use crate::headers::{
 use crate::huffman::HuffmanTable;
 use crate::idct::{choose_idct_func, choose_idct_1x1_func, choose_idct_4x4_func};
 use crate::marker::Marker;
-use crate::misc::SOFMarkers;
+use crate::misc::{try_zeroed_vec, SOFMarkers};
 use crate::upsampler::{
     choose_horizontal_samp_function, choose_hv_samp_function, choose_v_samp_function,
     generic_sampler, upsample_no_op
@@ -157,6 +157,8 @@ pub struct JpegDecoder<T> {
     pub(crate) coeff:    usize, // Solves some weird bug :)
     /// Extended XMP segments
     pub(crate) extended_xmp_segments: Vec<ExtendedXmpSegment>,
+    /// The most memory a decode may need, see [`JpegDecoder::set_max_memory`]
+    pub(crate) max_memory: Option<usize>,
 }
 
 impl<T> JpegDecoder<T>
@@ -203,6 +205,7 @@ where
             is_mjpeg:          false,
             coeff:             1,
             extended_xmp_segments: vec![],
+            max_memory:        None,
         }
     }
     /// Decode a buffer already in memory
@@ -214,10 +217,122 @@ where
     /// See DecodeErrors for an explanation
     pub fn decode(&mut self) -> Result<Vec<u8>, DecodeErrors> {
         self.decode_headers()?;
+        self.check_memory()?;
         let size = self.output_buffer_size().unwrap();
-        let mut out = vec![0; size];
+        let mut out = try_zeroed_vec(size)?;
         self.decode_into(&mut out)?;
         Ok(out)
+    }
+
+    /// Set the most memory, in bytes, that decoding this image may need, or `None` for no
+    /// limit (the default)
+    ///
+    /// Once the headers are decoded, [`decode`](Self::decode) and
+    /// [`decode_into`](Self::decode_into) compare [`estimated_memory`](Self::estimated_memory)
+    /// with the limit and return [`DecodeErrors::MemoryLimitExceeded`] before they allocate
+    /// anything whose size depends on the image dimensions.
+    ///
+    /// The image dimensions alone ([`DecoderOptions::set_max_width`] and
+    /// [`DecoderOptions::set_max_height`]) do not bound memory well: a progressive frame keeps a
+    /// 16-bit coefficient for every sample of every component until its last scan.
+    pub fn set_max_memory(&mut self, limit: Option<usize>) {
+        self.max_memory = limit;
+    }
+
+    /// The limit set with [`set_max_memory`](Self::set_max_memory), if any
+    #[must_use]
+    pub const fn max_memory(&self) -> Option<usize> {
+        self.max_memory
+    }
+
+    /// An upper bound, in bytes, of the memory that decoding this image allocates, from its
+    /// headers
+    ///
+    /// It counts the output buffer ([`output_buffer_size`](Self::output_buffer_size), so for
+    /// the output colour space of the current options), the 16-bit coefficients of every
+    /// component padded to whole MCUs when the frame is progressive or its first scan does not
+    /// hold every component, and the per-row buffers of the IDCT and the upsampling. It does
+    /// not count what the headers themselves took (tables, metadata), which is bounded by the
+    /// size of the input. The sum saturates at `usize::MAX`.
+    ///
+    /// # Returns
+    /// - `Some(bytes)`: the estimate
+    /// - `None`: the headers have not been decoded
+    #[must_use]
+    pub fn estimated_memory(&self) -> Option<usize> {
+        if !self.headers_decoded {
+            return None;
+        }
+        let output = self.output_buffer_size().unwrap_or(usize::MAX);
+        Some(output.saturating_add(self.working_memory()))
+    }
+
+    /// The memory a decode allocates besides the output, in bytes: an upper bound of the
+    /// buffers of `mcu.rs`, `mcu_prog.rs`, `worker.rs` and
+    /// [`Components::setup_upsample_scanline`], computed before `setup_component_params` runs.
+    fn working_memory(&self) -> usize {
+        let factor = |f: usize| f.max(1);
+        let h_max = self.components.iter().map(|c| factor(c.horizontal_sample)).max().unwrap_or(1);
+        let v_max = self.components.iter().map(|c| factor(c.vertical_sample)).max().unwrap_or(1);
+        let mcu_x = usize::from(self.info.width).div_ceil(8 * h_max);
+        let mcu_y = usize::from(self.info.height).div_ceil(8 * v_max);
+        // Converting a vertically subsampled image to one output component takes
+        // `v_max / h_max` times the MCU rows.
+        let mcu_rows = if self.options.jpeg_get_out_colorspace().num_components() == 1 {
+            mcu_y.saturating_mul(v_max.div_ceil(h_max))
+        } else {
+            mcu_y
+        };
+        // A whole-frame coefficient buffer per component: progressive frames, and sequential
+        // ones whose first scan does not hold every component.
+        let whole_frame =
+            self.is_progressive || usize::from(self.num_scans) < self.components.len();
+        let upsampled = h_max != 1 || v_max != 1;
+
+        let mut coefficients: usize = 0;
+        let mut rows: usize = 0;
+        let mut stride_max = 0;
+        for c in &self.components {
+            let (h, v) = (factor(c.horizontal_sample), factor(c.vertical_sample));
+            // The component's `width_stride` once `setup_component_params` has run.
+            let stride = h * mcu_x * 8;
+            stride_max = stride_max.max(stride);
+            if whole_frame {
+                let plane = (64 * h * v)
+                    .saturating_mul(mcu_x)
+                    .saturating_mul(mcu_rows);
+                coefficients = coefficients.saturating_add(plane);
+            }
+            // `raw_coeff`: one MCU row.
+            let raw = stride * v * 8;
+            rows = rows.saturating_add(raw);
+            if upsampled {
+                let sample = (h_max / h).max(1) * (v_max / v).max(1);
+                // `row` and `row_up`, `first_row_upsample_dest`, and `upsample_dest`, which
+                // `worker.rs` may grow to twice `raw_coeff`.
+                let upsample_dest = (stride * sample * 2 * 8).max(2 * raw);
+                rows = rows
+                    .saturating_add(2 * stride * v)
+                    .saturating_add(stride * v * sample)
+                    .saturating_add(upsample_dest);
+            }
+        }
+        if upsampled {
+            // The upsampler's scratch row.
+            rows = rows.saturating_add(stride_max * 8);
+        }
+        // Every buffer holds `i16`s.
+        coefficients.saturating_add(rows).saturating_mul(2)
+    }
+
+    /// [`DecodeErrors::MemoryLimitExceeded`] when the estimate is over the limit.
+    fn check_memory(&self) -> Result<(), DecodeErrors> {
+        if let (Some(limit), Some(needed)) = (self.max_memory, self.estimated_memory()) {
+            if needed > limit {
+                return Err(DecodeErrors::MemoryLimitExceeded(needed, limit));
+            }
+        }
+        Ok(())
     }
 
     /// Create a new Decoder instance
@@ -826,6 +941,7 @@ where
     ///
     pub fn decode_into(&mut self, out: &mut [u8]) -> Result<(), DecodeErrors> {
         self.decode_headers_internal()?;
+        self.check_memory()?;
 
         let expected_size = self.output_buffer_size().unwrap();
 

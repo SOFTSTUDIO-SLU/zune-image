@@ -35,7 +35,7 @@ use crate::errors::DecodeErrors;
 use crate::headers::parse_sos;
 use crate::marker::Marker;
 use crate::mcu::DCT_BLOCK;
-use crate::misc::{calculate_padded_width, setup_component_params};
+use crate::misc::{calculate_padded_width, setup_component_params, try_zeroed_vec};
 
 impl<T: ZByteReaderTrait> JpegDecoder<T> {
     /// Decode a progressive image
@@ -102,7 +102,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             let comp = &self.components[i];
             let len = mcu_width * comp.vertical_sample * comp.horizontal_sample * mcu_height;
 
-            block[i] = vec![0; len];
+            block[i] = try_zeroed_vec(len)?;
         }
 
         let mut stream = BitStream::new_progressive(self.succ_low, self.spec_start, self.spec_end);

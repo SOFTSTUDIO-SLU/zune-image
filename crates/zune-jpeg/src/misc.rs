@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use alloc::format;
+use alloc::vec::Vec;
 use core::cmp::max;
 use core::fmt;
 use core::num::NonZeroU32;
@@ -191,6 +192,16 @@ impl fmt::Debug for SOFMarkers {
 ///
 /// This modifies the components in place setting up details needed by other
 /// parts fo the decoder.
+/// A vector of `len` zeros, or [`DecodeErrors::OutOfMemory`] when the allocator refuses it (where
+/// `vec!` would abort the process).
+pub(crate) fn try_zeroed_vec<T: Copy + Default>(len: usize) -> Result<Vec<T>, DecodeErrors> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len)
+        .map_err(|_| DecodeErrors::OutOfMemory(len.saturating_mul(core::mem::size_of::<T>())))?;
+    v.resize(len, T::default());
+    Ok(v)
+}
+
 pub(crate) fn setup_component_params<T: ZByteReaderTrait>(
     img: &mut JpegDecoder<T>
 ) -> Result<(), DecodeErrors> {

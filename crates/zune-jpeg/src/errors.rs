@@ -50,7 +50,13 @@ pub enum DecodeErrors {
     /// Too small output for size
     TooSmallOutput(usize, usize),
 
-    IoErrors(ZByteIoError)
+    IoErrors(ZByteIoError),
+    /// The decode would need more memory than the limit set with
+    /// [`JpegDecoder::set_max_memory`](crate::JpegDecoder::set_max_memory):
+    /// the estimate, then the limit, in bytes
+    MemoryLimitExceeded(usize, usize),
+    /// The allocator refused a buffer of this many bytes
+    OutOfMemory(usize)
 }
 
 #[cfg(feature = "std")]
@@ -98,6 +104,8 @@ impl Debug for DecodeErrors {
             ),
             Self::TooSmallOutput(expected, found) => write!(f, "Too small output, expected buffer with at least {expected} bytes but got one with {found} bytes"),
             Self::IoErrors(error)=>write!(f,"I/O errors {error:?}"),
+            Self::MemoryLimitExceeded(needed, limit) => write!(f, "Decoding needs about {needed} bytes, more than the memory limit of {limit} bytes"),
+            Self::OutOfMemory(bytes) => write!(f, "Could not allocate {bytes} bytes"),
         }
     }
 }
