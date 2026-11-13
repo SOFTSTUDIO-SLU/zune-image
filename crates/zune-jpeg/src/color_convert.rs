@@ -24,6 +24,7 @@
 //! Currently supported conversions are
 //!
 //! - `YCbCr` to `RGB,RGBA,GRAYSCALE,RGBX`.
+//! - `YCCK` to `CMYK` (through [`ycbcr_to_rgb_pixel`]).
 //!
 //!
 //! Hey there, if your reading this it means you probably need something, so let me help you.
@@ -47,7 +48,7 @@
 //!
 //! Therefore if your looking to optimize some routines, probably start there.
 
-pub use scalar::ycbcr_to_grayscale;
+pub use scalar::{ycbcr_to_grayscale, ycbcr_to_rgb_pixel};
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 

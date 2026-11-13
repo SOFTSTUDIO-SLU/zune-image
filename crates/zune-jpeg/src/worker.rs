@@ -12,7 +12,7 @@ use core::cmp::min;
 
 use zune_core::colorspace::ColorSpace;
 
-use crate::color_convert::ycbcr_to_grayscale;
+use crate::color_convert::{ycbcr_to_grayscale, ycbcr_to_rgb_pixel};
 use crate::components::{Components, SampleRatios};
 use crate::decoder::{ColorConvert16Ptr, MAX_COMPONENTS};
 use crate::errors::DecodeErrors;
@@ -80,6 +80,9 @@ pub(crate) fn color_convert(
                 color_convert_16,
                 output
             );
+        }
+        (ColorSpace::YCCK, ColorSpace::CMYK) => {
+            color_convert_ycck_to_cmyk(unprocessed, width, padded_width, output);
         }
         (ColorSpace::CMYK, ColorSpace::RGB) => {
             color_convert_cymk_to_rgb::<3>(unprocessed, width, padded_width, output);
@@ -250,6 +253,35 @@ fn color_convert_ycck_to_rgb<const NUM_COMPONENTS: usize>(
             pix[0] = blinn_8x8(255 - pix[0], m);
             pix[1] = blinn_8x8(255 - pix[1], m);
             pix[2] = blinn_8x8(255 - pix[2], m);
+        }
+    }
+}
+
+/// Convert a YCCK image to CMYK: Y, Cb and Cr to RGB as for a YCbCr image, each inverted to
+/// C, M and Y; K as stored
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn color_convert_ycck_to_cmyk(
+    mcu_block: &[&[i16]; MAX_COMPONENTS], width: usize, padded_width: usize, output: &mut [u8]
+) {
+    for ((((pix_w, y_w), cb_w), cr_w), k_w) in output
+        .chunks_exact_mut(width * 4)
+        .zip(mcu_block[0].chunks_exact(padded_width))
+        .zip(mcu_block[1].chunks_exact(padded_width))
+        .zip(mcu_block[2].chunks_exact(padded_width))
+        .zip(mcu_block[3].chunks_exact(padded_width))
+    {
+        for ((((pix, y), cb), cr), k) in pix_w
+            .chunks_exact_mut(4)
+            .zip(y_w)
+            .zip(cb_w)
+            .zip(cr_w)
+            .zip(k_w)
+        {
+            let [r, g, b] = ycbcr_to_rgb_pixel(*y, *cb, *cr);
+            pix[0] = 255 - r;
+            pix[1] = 255 - g;
+            pix[2] = 255 - b;
+            pix[3] = *k as u8;
         }
     }
 }

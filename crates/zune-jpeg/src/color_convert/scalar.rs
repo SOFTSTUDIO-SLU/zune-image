@@ -127,6 +127,23 @@ pub fn ycbcr_to_rgb_inner_16_scalar<const BGRA: bool>(
     *pos += 48;
 }
 
+/// One YCbCr sample to RGB, with the arithmetic of the 16-pixel functions above
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn ycbcr_to_rgb_pixel(y: i16, cb: i16, cr: i16) -> [u8; 3] {
+    let cr = cr - 128;
+    let cb = cb - 128;
+
+    let y0 = i32::from(y) * i32::from(Y_CF) + i32::from(YUV_RND);
+
+    let r = (y0 + i32::from(cr) * i32::from(CR_CF)) >> YUV_PREC;
+    let g = (y0
+        + i32::from(cr) * i32::from(C_G_CR_COEF_1)
+        + i32::from(cb) * i32::from(C_G_CB_COEF_2))
+        >> YUV_PREC;
+    let b = (y0 + i32::from(cb) * i32::from(CB_CF)) >> YUV_PREC;
+    [clamp(r), clamp(g), clamp(b)]
+}
+
 pub fn ycbcr_to_grayscale(y: &[i16], width: usize, padded_width: usize, output: &mut [u8]) {
     for (y_in, out) in y
         .chunks_exact(padded_width)
