@@ -500,6 +500,12 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             // number of MCU's are the widths (+7 to account for paddings) divided by 8.
             self.info.height.div_ceil(8) as usize
         };
+        // MCUs per row, as the coefficient buffers were allocated with.
+        let mcu_width = if self.is_interleaved {
+            self.mcu_x
+        } else {
+            usize::from(self.info.width).div_ceil(8)
+        };
 
         // Size of our output image(width*height)
         let is_hv = usize::from(self.is_interleaved);
@@ -551,11 +557,21 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 //
                 // For interleaved images, this gives us the exact pixels comprising a whole MCU
                 // block
-                let step = block[position].len() / mcu_height;
+                //
+                // The step is one MCU row of the buffer as it was allocated, not
+                // `block.len() / mcu_height`: for a grey output of a vertically sampled image
+                // (`self.coeff = 2`) the buffers are sized for twice as many MCU rows as there
+                // are stripes, which would double the step and read the wrong rows.
+                let step = mcu_width
+                    * 64
+                    * component.vertical_sample
+                    * component.horizontal_sample;
                 // where we will be reading our pixels from.
                 let start = i * step;
 
-                let slice = &block[position][start..start + step];
+                let slice = block[position]
+                    .get(start..start + step)
+                    .ok_or(DecodeErrors::FormatStatic("Component buffer too small"))?;
 
                 let temp_channel = &mut component.raw_coeff;
 

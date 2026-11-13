@@ -272,16 +272,6 @@ fn estimate_bounds_the_peak() {
                     _ => &[ColorSpace::CMYK, ColorSpace::RGB]
                 };
                 for &out in outs {
-                    // A grey output of a vertically subsampled colour image coded a scan per
-                    // component panics in 0.5.15 (`mcu.rs`, `finish_baseline_decoding`), a
-                    // decoder bug apart from the memory limit.
-                    if coding == Coding::ScanPerComponent
-                        && out == ColorSpace::Luma
-                        && factors.len() > 1
-                        && factors.iter().any(|f| f.1 > 1)
-                    {
-                        continue;
-                    }
                     for (strict, idct) in [(true, false), (false, false), (true, true), (false, true)] {
                         let options = if strict { options(out) } else { lenient(out) };
                         let mut decoder =

@@ -108,6 +108,11 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             mcu_width = (self.info.width as usize + 7) / 8;
             mcu_height = (self.info.height as usize + 7) / 8;
         }
+        // If all components are contained in the first scan of MCUs, then we can process into
+        // (upsampled) pixels immediately after each MCU, for convenience we use each row of MCUS.
+        // Otherwise, we must first wait until following SOS provide the remaining components.
+        let all_components_in_first_scan = usize::from(self.num_scans) == self.components.len();
+
         if self.is_interleaved
             && self.input_colorspace.num_components() > 1
             && self.options.jpeg_get_out_colorspace().num_components() == 1
@@ -122,8 +127,14 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             //
             // set coeff to be 2 to ensure that we increment two rows
             // for every mcu processed also
-            mcu_height *= self.v_max;
-            mcu_height /= self.h_max;
+            //
+            // Not when the components come in separate scans: each scan is decoded one MCU row
+            // of the frame at a time, `mcu_y` rows as for a colour output, and more rows would
+            // read past the end of the scan's data.
+            if all_components_in_first_scan {
+                mcu_height *= self.v_max;
+                mcu_height /= self.h_max;
+            }
             self.coeff = 2;
         }
 
@@ -168,10 +179,6 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             }
         }
 
-        // If all components are contained in the first scan of MCUs, then we can process into
-        // (upsampled) pixels immediately after each MCU, for convenience we use each row of MCUS.
-        // Otherwise, we must first wait until following SOS provide the remaining components.
-        let all_components_in_first_scan = usize::from(self.num_scans) == self.components.len();
         let mut progressive_mcus: [Vec<i16>; 4] = core::array::from_fn(|_| vec![]);
 
         if !all_components_in_first_scan {
@@ -328,7 +335,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cast_sign_loss)]
     pub(crate) fn finish_baseline_decoding(
-        &mut self, block: &[Vec<i16>; MAX_COMPONENTS], _mcu_width: usize, pixels: &mut [u8]
+        &mut self, block: &[Vec<i16>; MAX_COMPONENTS], mcu_width: usize, pixels: &mut [u8]
     ) -> Result<(), DecodeErrors> {
         let mcu_height = self.mcu_y;
 
@@ -367,19 +374,25 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     continue 'component;
                 }
 
-                // step is the number of pixels this iteration wil be handling
-                // Given by the number of mcu's height and the length of the component block
-                // Since the component block contains the whole channel as raw pixels
-                // we this evenly divides the pixels into MCU blocks
-                //
-                // For interleaved images, this gives us the exact pixels comprising a whole MCU
-                // block
-                let step = block[position].len() / mcu_height;
+                // step is the number of samples in one stripe of MCUs of this component: one
+                // MCU row of the buffer as it was allocated, not `block.len() / mcu_height`,
+                // which is wrong if the buffer holds more rows than the `mcu_y` stripes.
+                let step = mcu_width
+                    * 64
+                    * component.vertical_sample
+                    * component.horizontal_sample
+                    * component.idct_h_scale
+                    * component.idct_v_scale;
 
                 // where we will be reading our pixels from.
-                let slice = &block[position][i * step..][..step];
-                let temp_channel = &mut component.raw_coeff;
-                temp_channel[..step].copy_from_slice(slice);
+                let slice = block[position]
+                    .get(i * step..(i + 1) * step)
+                    .ok_or(DecodeErrors::FormatStatic("Component buffer too small"))?;
+                let temp_channel = component
+                    .raw_coeff
+                    .get_mut(..step)
+                    .ok_or(DecodeErrors::FormatStatic("Component buffer too small"))?;
+                temp_channel.copy_from_slice(slice);
             }
 
             // process that whole stripe of MCUs
