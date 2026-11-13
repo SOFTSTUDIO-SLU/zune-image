@@ -76,7 +76,12 @@ pub(crate) struct Components {
     pub y: usize,
     pub sample_ratio: SampleRatios,
     // a very annoying bug
-    pub fix_an_annoying_bug: usize
+    pub fix_an_annoying_bug: usize,
+    /// How many times wider than its blocks the inverse DCT makes this component (1 or 2), see
+    /// `JpegDecoder::set_idct_upsampling`; `width_stride` counts the samples after it
+    pub idct_h_scale: usize,
+    /// How many times taller than its blocks the inverse DCT makes this component (1 or 2)
+    pub idct_v_scale: usize
 }
 
 impl Components {
@@ -174,7 +179,9 @@ impl Components {
             y: 0,
             w2: 0,
             sample_ratio: SampleRatios::None,
-            fix_an_annoying_bug: 1
+            fix_an_annoying_bug: 1,
+            idct_h_scale: 1,
+            idct_v_scale: 1
         })
     }
     /// Setup space for upsampling
@@ -192,8 +199,20 @@ impl Components {
         self.row_up = vec![0; self.width_stride * self.vertical_sample];
         self.first_row_upsample_dest =
             vec![128; self.vertical_sample * self.width_stride * self.sample_ratio.sample()];
-        self.upsample_dest =
-            vec![0; self.width_stride * self.sample_ratio.sample() * self.fix_an_annoying_bug * 8];
+        self.upsample_dest = vec![
+            0;
+            self.width_stride
+                * self.sample_ratio.sample()
+                * self.fix_an_annoying_bug
+                * 8
+                * self.idct_v_scale
+        ];
+    }
+
+    /// The samples per row of the component's blocks before any upsampling inverse DCT:
+    /// `width_stride` divided by `idct_h_scale`. Coefficient buffers are laid out by it.
+    pub fn coded_stride(&self) -> usize {
+        self.width_stride / self.idct_h_scale
     }
 }
 

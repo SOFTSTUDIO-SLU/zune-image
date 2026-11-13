@@ -45,6 +45,7 @@ pub mod avx2;
 pub mod neon;
 
 pub mod scalar;
+pub mod scaled;
 
 /// Choose an appropriate IDCT function
 #[allow(unused_variables)]

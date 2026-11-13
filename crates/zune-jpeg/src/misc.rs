@@ -326,6 +326,17 @@ pub(crate) fn setup_component_params<T: ZByteReaderTrait>(
         // initially stride contains its horizontal sub-sampling
         component.width_stride *= img.mcu_x * 8;
     }
+    // An upsampling inverse DCT makes components wider and taller than their blocks.
+    let scales: Vec<(usize, usize)> = img
+        .components
+        .iter()
+        .map(|c| img.idct_scales(c.horizontal_sample, c.vertical_sample, img.h_max, img.v_max))
+        .collect();
+    for (component, (h_scale, v_scale)) in img.components.iter_mut().zip(scales) {
+        component.idct_h_scale = h_scale;
+        component.idct_v_scale = v_scale;
+        component.width_stride *= h_scale;
+    }
     {
         // Sampling factors are one thing that suck
         // this fixes a specific problem with images like

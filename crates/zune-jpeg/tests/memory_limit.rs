@@ -241,8 +241,8 @@ fn lenient(out: ColorSpace) -> DecoderOptions {
 }
 
 /// The estimate is an upper bound of what a decode allocates, for every coding, sampling and
-/// output colour space, in the strict mode and in the lenient one, and a close one for
-/// progressive frames. (A few combinations of
+/// output colour space, in the strict mode and in the lenient one, with the upsampling inverse
+/// DCT and without it, and a close one for progressive frames. (A few combinations of
 /// vertical subsampling and a grey output fail the strict mode on these images: the decoder
 /// reads more blocks than the scan has. The lenient mode decodes them.)
 fn estimate_bounds_the_peak() {
@@ -254,6 +254,8 @@ fn estimate_bounds_the_peak() {
         &[(2, 1), (1, 1), (1, 1)],
         &[(1, 2), (1, 1), (1, 1)],
         &[(4, 1), (1, 1), (1, 1)],
+        &[(4, 2), (1, 1), (1, 1)],
+        &[(2, 2), (2, 1), (1, 1)],
         &[(1, 1), (1, 1), (1, 1), (1, 1)],
         &[(2, 2), (1, 1), (1, 1), (2, 2)]
     ];
@@ -280,10 +282,11 @@ fn estimate_bounds_the_peak() {
                     {
                         continue;
                     }
-                    for strict in [true, false] {
+                    for (strict, idct) in [(true, false), (false, false), (true, true), (false, true)] {
                         let options = if strict { options(out) } else { lenient(out) };
                         let mut decoder =
                             JpegDecoder::new_with_options(ZCursor::new(&jpeg), options);
+                        decoder.set_idct_upsampling(idct);
                         decoder.decode_headers().unwrap();
                         let estimate = decoder.estimated_memory().unwrap();
                         let (pixels, peak) = peak_of(|| decoder.decode());
@@ -291,7 +294,7 @@ fn estimate_bounds_the_peak() {
                         let message = if pixels.is_err() { 256 } else { 0 };
                         assert!(
                             peak <= estimate + message,
-                            "{frame:?} to {out:?}: peak {peak} > estimate {estimate} ({pixels:?})"
+                            "{frame:?} to {out:?} (idct {idct}): peak {peak} > estimate {estimate} ({pixels:?})"
                         );
                         // Tight enough to charge against a budget: where the coefficients
                         // dominate, within a third of the peak.
@@ -305,8 +308,8 @@ fn estimate_bounds_the_peak() {
                             Ok(pixels) => {
                                 assert_eq!(pixels.len(), decoder.output_buffer_size().unwrap());
                             }
-                            Err(e) if strict => eprintln!("strict: {frame:?} to {out:?}: {e:?}"),
-                            Err(e) => panic!("{frame:?} to {out:?}: {e:?}")
+                            Err(e) if strict => eprintln!("strict (idct {idct}): {frame:?} to {out:?}: {e:?}"),
+                            Err(e) => panic!("{frame:?} to {out:?} (idct {idct}): {e:?}")
                         }
                     }
                 }

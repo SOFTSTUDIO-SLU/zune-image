@@ -33,6 +33,7 @@ use crate::components::SampleRatios;
 use crate::decoder::{JpegDecoder, MAX_COMPONENTS};
 use crate::errors::DecodeErrors;
 use crate::headers::parse_sos;
+use crate::idct::scaled::idct_scaled;
 use crate::marker::Marker;
 use crate::mcu::DCT_BLOCK;
 use crate::misc::{calculate_padded_width, setup_component_params, try_zeroed_vec};
@@ -258,7 +259,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         // handle EOB runs here.
                         stream.eob_run -= 1;
                     } else {
-                        let start = 64 * (j + i * (self.components[k].width_stride / 8));
+                        let start = 64 * (j + i * (self.components[k].coded_stride() / 8));
 
                         let data: &mut [i16; 64] = buffer
                             .get_mut(k)
@@ -394,7 +395,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                             for h_samp in 0..component.horizontal_sample {
                                 let x2 = j * component.horizontal_sample + h_samp;
                                 let y2 = i * component.vertical_sample + v_samp;
-                                let position = 64 * (x2 + y2 * component.width_stride / 8);
+                                let position = 64 * (x2 + y2 * component.coded_stride() / 8);
                                 let buf_n = &mut buffer[n];
 
                                 let Some(data) = &mut buf_n.get_mut(position) else {
@@ -524,7 +525,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 // allocate enough space to hold a whole MCU width
                 // this means we should take into account sampling ratios
                 // `*8` is because each MCU spans 8 widths.
-                let len = comp.width_stride * comp.vertical_sample * 8;
+                let len = comp.width_stride * comp.vertical_sample * comp.idct_v_scale * 8;
 
                 comp.needed = true;
                 comp.raw_coeff = vec![0; len];
@@ -562,14 +563,17 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 // To figure out how many pixels we iterate by we use effective pixels
                 // Given to us by component.x
                 // iterate per effective pixels.
-                let mcu_x = component.width_stride / 8;
+                // Blocks per row; an upsampling inverse DCT makes each 8 * scale samples.
+                let (h_scale, v_scale) = (component.idct_h_scale, component.idct_v_scale);
+                let coded_stride = component.width_stride / h_scale;
+                let mcu_x = coded_stride / 8;
 
                 // iterate per every vertical sample.
                 for k in 0..component.vertical_sample {
                     for j in 0..mcu_x {
                         // after writing a single stride, we need to skip 8 rows.
                         // This does the row calculation
-                        let width_stride = k * 8 * component.width_stride;
+                        let width_stride = k * 8 * coded_stride;
                         let start = j * 64 + width_stride;
 
                         // See https://github.com/etemesi254/zune-image/issues/262 sample 3.
@@ -587,9 +591,13 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         // determine where to write.
                         let sl = &mut temp_channel[component.idct_pos..];
 
-                        component.idct_pos += 8;
+                        component.idct_pos += 8 * h_scale;
                         // tmp now contains a dequantized block so idct it
-                        (self.idct_func)(&mut tmp, sl, component.width_stride);
+                        if h_scale * v_scale > 1 {
+                            idct_scaled(&tmp, sl, component.width_stride, h_scale, v_scale);
+                        } else {
+                            (self.idct_func)(&mut tmp, sl, component.width_stride);
+                        }
                     }
                     // after every write of 8, skip 7 since idct write stride wise 8 times.
                     //
@@ -597,7 +605,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     // sl
                     //
                     // and component.idct_pos is one stride long
-                    component.idct_pos += 7 * component.width_stride;
+                    component.idct_pos += (8 * v_scale - 1) * component.width_stride;
                 }
                 component.idct_pos = 0;
             }

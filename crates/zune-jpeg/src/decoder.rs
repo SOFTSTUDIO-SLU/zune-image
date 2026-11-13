@@ -167,6 +167,9 @@ pub struct JpegDecoder<T> {
     pub(crate) adobe_transform: Option<u8>,
     /// The caller's colour transform, see [`JpegDecoder::set_color_transform`]
     pub(crate) color_transform: Option<ColorTransform>,
+    /// Whether 2× subsampled components are upsampled by the inverse DCT, see
+    /// [`JpegDecoder::set_idct_upsampling`]
+    pub(crate) idct_upsampling: bool,
 }
 
 /// How the samples of a frame map to colours, chosen by the caller (see
@@ -254,6 +257,7 @@ where
             bytes_before_soi:  0,
             adobe_transform:   None,
             color_transform:   None,
+            idct_upsampling:   false,
         }
     }
     /// Decode a buffer already in memory
@@ -355,6 +359,51 @@ where
         self.color_transform
     }
 
+    /// Whether a component subsampled by 2 is upsampled by the inverse DCT, as libjpeg 7 and
+    /// later do (default `false`: the decoder's triangle filter)
+    ///
+    /// When set, the 8×8 coefficients of such a component are transformed straight to 16×16
+    /// samples (16×8 or 8×16 where only one direction is subsampled by 2 or more): the same
+    /// cosine sum evaluated at twice the rate, so a flat block stays flat and edges between
+    /// blocks are not blended. Whatever factor remains after that (subsampling by 4, or by an
+    /// odd factor) is filled in by repeating samples. This is what libjpeg 7 and later
+    /// (`jdmaster.c`, "fancy" upsampling, its default) do, so the output matches theirs to
+    /// within a level; libjpeg-turbo and this decoder's default use a triangle filter, which
+    /// blends neighbouring chroma samples.
+    ///
+    /// It has no effect on a frame without subsampling, or when the output colour space has one
+    /// component (only the luma is decoded then).
+    pub fn set_idct_upsampling(&mut self, on: bool) {
+        self.idct_upsampling = on;
+    }
+
+    /// Whether [`set_idct_upsampling`](Self::set_idct_upsampling) is on
+    #[must_use]
+    pub const fn idct_upsampling(&self) -> bool {
+        self.idct_upsampling
+    }
+
+    /// Whether [`set_idct_upsampling`](Self::set_idct_upsampling) applies to this frame, whose
+    /// largest sampling factors are `h_max` and `v_max`: it is set, the frame is subsampled, and
+    /// more than the luma is decoded.
+    pub(crate) fn idct_upsampling_active(&self, h_max: usize, v_max: usize) -> bool {
+        self.idct_upsampling
+            && (h_max > 1 || v_max > 1)
+            && self.input_colorspace != ColorSpace::Luma
+            && self.options.jpeg_get_out_colorspace().num_components() > 1
+    }
+
+    /// The factors by which the inverse DCT upsamples a component with sampling factors `h`
+    /// and `v` in a frame whose largest factors are `h_max` and `v_max`: 2 in a direction
+    /// whose subsampling factor is even (libjpeg's rule, at most 2), otherwise 1.
+    pub(crate) fn idct_scales(&self, h: usize, v: usize, h_max: usize, v_max: usize) -> (usize, usize) {
+        if !self.idct_upsampling_active(h_max, v_max) || h == 0 || v == 0 {
+            return (1, 1);
+        }
+        let scale = |f: usize, max: usize| if max % (2 * f) == 0 { 2 } else { 1 };
+        (scale(h, h_max), scale(v, v_max))
+    }
+
     /// Skips to the first SOI marker that is followed by another marker, where the data does
     /// not start with SOI. The first two bytes, `magic_bytes`, have been read.
     ///
@@ -427,23 +476,29 @@ where
         let mut stride_max = 0;
         for c in &self.components {
             let (h, v) = (factor(c.horizontal_sample), factor(c.vertical_sample));
+            // An upsampling inverse DCT makes a component's samples `h_scale` × `v_scale` times
+            // its blocks.
+            let (h_scale, v_scale) = self.idct_scales(h, v, h_max, v_max);
             // The component's `width_stride` once `setup_component_params` has run.
-            let stride = h * mcu_x * 8;
+            let stride = h * h_scale * mcu_x * 8;
             stride_max = stride_max.max(stride);
             if whole_frame {
-                let plane = (64 * h * v)
+                // Coefficients for a progressive frame; samples, after the inverse DCT, for a
+                // sequential one.
+                let scale = if self.is_progressive { 1 } else { h_scale * v_scale };
+                let plane = (64 * h * v * scale)
                     .saturating_mul(mcu_x)
                     .saturating_mul(mcu_rows);
                 coefficients = coefficients.saturating_add(plane);
             }
             // `raw_coeff`: one MCU row.
-            let raw = stride * v * 8;
+            let raw = stride * v * v_scale * 8;
             rows = rows.saturating_add(raw);
             if upsampled {
-                let sample = (h_max / h).max(1) * (v_max / v).max(1);
+                let sample = (h_max / (h * h_scale)).max(1) * (v_max / (v * v_scale)).max(1);
                 // `row` and `row_up`, `first_row_upsample_dest`, and `upsample_dest`, which
                 // `worker.rs` may grow to twice `raw_coeff`.
-                let upsample_dest = (stride * sample * 2 * 8).max(2 * raw);
+                let upsample_dest = (stride * sample * 2 * 8 * v_scale).max(2 * raw);
                 rows = rows
                     .saturating_add(2 * stride * v)
                     .saturating_add(stride * v * sample)
@@ -1147,14 +1202,21 @@ where
             return Ok(());
         }
 
+        let replicate = self.idct_upsampling_active(self.h_max, self.v_max);
         for comp in &mut self.components {
-            let hs = self.h_max / comp.horizontal_sample;
-            let vs = self.v_max / comp.vertical_sample;
+            let hs = self.h_max / (comp.horizontal_sample * comp.idct_h_scale);
+            let vs = self.v_max / (comp.vertical_sample * comp.idct_v_scale);
 
             let samp_factor = match (hs, vs) {
                 (1, 1) => {
                     comp.sample_ratio = SampleRatios::None;
                     upsample_no_op
+                }
+                // What the inverse DCT leaves is filled in by repeating samples, as libjpeg
+                // does.
+                (hs, vs) if replicate => {
+                    comp.sample_ratio = SampleRatios::Generic(hs, vs);
+                    generic_sampler()
                 }
                 (2, 1) => {
                     comp.sample_ratio = SampleRatios::H;

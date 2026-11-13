@@ -12,9 +12,11 @@
 //! The quantization table has step 1 for every coefficient, so a block's coefficients are the
 //! dequantized ones the decoder works with: a flat block of value `v` has the DC coefficient
 //! `8 * (v - 128)`. Both Huffman tables give every symbol an eight-bit code, the symbols in
-//! increasing order, so that any coefficient can be coded. A frame of more than one component
-//! is one interleaved scan. The marker layout follows ITU-T T.81 Annex B; the APP14 segment of
-//! Adobe follows Adobe Technical Note #5116.
+//! increasing order, so that any coefficient can be coded. The frame is coded in one
+//! interleaved scan, a scan per component, or progressively (a DC scan of all components, then
+//! one AC scan per component with the whole band 1-63 and no successive approximation). The
+//! marker layout follows ITU-T T.81 Annex B and the progressive scans its Annex G; the APP14
+//! segment of Adobe follows Adobe Technical Note #5116.
 
 #![allow(dead_code)]
 
@@ -37,13 +39,25 @@ pub struct Component {
     pub blocks: Vec<[i32; 64]>
 }
 
-/// A baseline frame.
+/// How a frame's scans are laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coding {
+    /// Sequential, all components in one scan.
+    Interleaved,
+    /// Sequential, one scan per component.
+    ScanPerComponent,
+    /// Progressive: a DC scan of all components, then an AC scan per component.
+    Progressive
+}
+
+/// A frame.
 pub struct Frame {
     pub width:      u16,
     pub height:     u16,
     pub components: Vec<Component>,
     /// The transform byte of an Adobe APP14 segment, if the file has one.
-    pub adobe:      Option<u8>
+    pub adobe:      Option<u8>,
+    pub coding:     Coding
 }
 
 /// The coefficients of a flat block of `value`.
@@ -61,7 +75,8 @@ impl Frame {
             width,
             height,
             components: Vec::new(),
-            adobe: None
+            adobe: None,
+            coding: Coding::Interleaved
         };
         for &(id, h, v) in layout {
             frame.components.push(Component {
@@ -122,14 +137,15 @@ impl Frame {
         dqt.extend([1; 64]);
         segment(&mut out, 0xDB, &dqt);
 
-        // SOF0: 8-bit samples; each component uses table 0.
+        // SOF0 or SOF2: 8-bit samples; each component uses table 0.
         let [h0, h1] = self.height.to_be_bytes();
         let [w0, w1] = self.width.to_be_bytes();
         let mut sof = vec![8, h0, h1, w0, w1, self.components.len() as u8];
         for c in &self.components {
             sof.extend([c.id, (c.h << 4) | c.v, 0]);
         }
-        segment(&mut out, 0xC0, &sof);
+        let sof_marker = if self.coding == Coding::Progressive { 0xC2 } else { 0xC0 };
+        segment(&mut out, sof_marker, &sof);
 
         // DHT: DC table 0 with the categories 0-11, AC table 0 with every run/size symbol;
         // all codes eight bits long.
@@ -143,45 +159,95 @@ impl Frame {
         ac.extend(&symbols);
         segment(&mut out, 0xC4, &ac);
 
-        // SOS: every component with tables 0/0, spectral selection 0-63.
-        let mut sos = vec![self.components.len() as u8];
-        for c in &self.components {
-            sos.extend([c.id, 0x00]);
-        }
-        sos.extend([0, 63, 0]);
-        segment(&mut out, 0xDA, &sos);
-
-        for b in pack(&self.scan_bits(&symbols)) {
-            out.push(b);
-            if b == 0xFF {
-                out.push(0x00);
+        let all: Vec<usize> = (0..self.components.len()).collect();
+        match self.coding {
+            Coding::Interleaved => self.scan(&mut out, &all, Band::Both, &symbols),
+            Coding::ScanPerComponent => {
+                for c in all {
+                    self.scan(&mut out, &[c], Band::Both, &symbols);
+                }
+            }
+            Coding::Progressive => {
+                self.scan(&mut out, &all, Band::Dc, &symbols);
+                for c in all {
+                    self.scan(&mut out, &[c], Band::Ac, &symbols);
+                }
             }
         }
         out.extend([0xFF, 0xD9]);
         out
     }
 
-    fn scan_bits(&self, ac_symbols: &[u8]) -> Vec<bool> {
+    /// One scan of `components` (indexes) over `band`, header and data.
+    fn scan(&self, out: &mut Vec<u8>, components: &[usize], band: Band, ac_symbols: &[u8]) {
+        let mut sos = vec![components.len() as u8];
+        for &c in components {
+            sos.extend([self.components[c].id, 0x00]);
+        }
+        let (ss, se) = match band {
+            Band::Both => (0, 63),
+            Band::Dc => (0, 0),
+            Band::Ac => (1, 63)
+        };
+        sos.extend([ss, se, 0]);
+        segment(out, 0xDA, &sos);
+
         let mut bits = Vec::new();
         let mut predictions = vec![0i32; self.components.len()];
-        let (mcus_x, mcus_y) = self.mcus();
-        for my in 0..mcus_y {
-            for mx in 0..mcus_x {
-                for (c, comp) in self.components.iter().enumerate() {
-                    let (wide, _) = self.grid(c);
-                    for v in 0..usize::from(comp.v) {
-                        for h in 0..usize::from(comp.h) {
-                            let bx = mx * usize::from(comp.h) + h;
-                            let by = my * usize::from(comp.v) + v;
-                            let block = &comp.blocks[by * wide + bx];
-                            block_bits(&mut bits, block, &mut predictions[c], ac_symbols);
+        let mut code = |bits: &mut Vec<bool>, c: usize, bx: usize, by: usize| {
+            let (wide, _) = self.grid(c);
+            let block = &self.components[c].blocks[by * wide + bx];
+            if band != Band::Ac {
+                dc_bits(bits, block, &mut predictions[c]);
+            }
+            if band != Band::Dc {
+                ac_bits(bits, block, ac_symbols);
+            }
+        };
+        if components.len() == 1 {
+            // A scan of one component covers its own blocks, not whole MCUs.
+            let c = components[0];
+            let (h_max, v_max) = self.max_factors();
+            let comp = &self.components[c];
+            let wide = (usize::from(self.width) * usize::from(comp.h)).div_ceil(h_max).div_ceil(8);
+            let high = (usize::from(self.height) * usize::from(comp.v)).div_ceil(v_max).div_ceil(8);
+            for by in 0..high {
+                for bx in 0..wide {
+                    code(&mut bits, c, bx, by);
+                }
+            }
+        } else {
+            let (mcus_x, mcus_y) = self.mcus();
+            for my in 0..mcus_y {
+                for mx in 0..mcus_x {
+                    for &c in components {
+                        let comp = &self.components[c];
+                        for v in 0..usize::from(comp.v) {
+                            for h in 0..usize::from(comp.h) {
+                                let bx = mx * usize::from(comp.h) + h;
+                                let by = my * usize::from(comp.v) + v;
+                                code(&mut bits, c, bx, by);
+                            }
                         }
                     }
                 }
             }
         }
-        bits
+        for b in pack(&bits) {
+            out.push(b);
+            if b == 0xFF {
+                out.push(0x00);
+            }
+        }
     }
+}
+
+/// The coefficients a scan codes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Band {
+    Both,
+    Dc,
+    Ac
 }
 
 /// The 16 code-length counts of a table whose `count` codes are all eight bits long.
@@ -210,15 +276,20 @@ fn magnitude(value: i32) -> (u32, u32) {
     (size, extra as u32 & ((1u32 << size) - 1))
 }
 
-fn block_bits(bits: &mut Vec<bool>, block: &[i32; 64], prediction: &mut i32, ac_symbols: &[u8]) {
-    // With codes all eight bits long in increasing symbol order, a symbol's code is its index.
-    let code = |symbol: u8| ac_symbols.iter().position(|&s| s == symbol).unwrap() as u32;
-
+fn dc_bits(bits: &mut Vec<bool>, block: &[i32; 64], prediction: &mut i32) {
+    // With codes all eight bits long in increasing symbol order, a symbol's code is its index,
+    // and the DC symbols are the categories 0-11.
     let diff = block[0] - *prediction;
     *prediction = block[0];
     let (size, extra) = magnitude(diff);
     push(bits, size, 8);
     push(bits, extra, size);
+}
+
+/// The AC coefficients of a block: run/size symbols, then an end of block (in a progressive
+/// scan the symbol 0 is an end-of-band run of one block, the same thing).
+fn ac_bits(bits: &mut Vec<bool>, block: &[i32; 64], ac_symbols: &[u8]) {
+    let code = |symbol: u8| ac_symbols.iter().position(|&s| s == symbol).unwrap() as u32;
 
     let mut run = 0u8;
     for &natural in &ZIGZAG[1..] {

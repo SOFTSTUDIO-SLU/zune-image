@@ -19,6 +19,7 @@ use crate::bitstream::BitStream;
 use crate::components::SampleRatios;
 use crate::decoder::MAX_COMPONENTS;
 use crate::errors::DecodeErrors;
+use crate::idct::scaled::idct_scaled;
 use crate::marker::Marker;
 use crate::mcu_prog::get_marker;
 use crate::misc::{calculate_padded_width, setup_component_params, try_zeroed_vec};
@@ -158,7 +159,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 // allocate enough space to hold a whole MCU width
                 // this means we should take into account sampling ratios
                 // `*8` is because each MCU spans 8 widths.
-                let len = comp.width_stride * comp.vertical_sample * 8;
+                let len = comp.width_stride * comp.vertical_sample * comp.idct_v_scale * 8;
 
                 comp.needed = true;
                 comp.raw_coeff = vec![0; len];
@@ -178,6 +179,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 let len = mcu_width
                     * component.vertical_sample
                     * component.horizontal_sample
+                    * component.idct_h_scale
+                    * component.idct_v_scale
                     * mcu_height
                     * 64;
                 *mcu = try_zeroed_vec(len)?;
@@ -464,7 +467,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         if PROGRESSIVE && z_scans.len() > 1 {
             let min_du = z_scans
                 .iter()
-                .map(|&k| self.components[k].width_stride / 8)
+                .map(|&k| self.components[k].coded_stride() / 8)
                 .min()
                 .unwrap_or(0);
             scan_du_width = scan_du_width.min(min_du);
@@ -490,8 +493,11 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
                 let qt_table = &component.quantization_table;
                 let channel = if PROGRESSIVE {
-                    let offset =
-                        mcu_height * component.width_stride * 8 * component.vertical_sample;
+                    let offset = mcu_height
+                        * component.width_stride
+                        * 8
+                        * component.vertical_sample
+                        * component.idct_v_scale;
                     // Small stopgap for https://github.com/etemesi254/zune-image/issues/362
                     if offset >= progressive[k].len(){
                         return Err(DecodeErrors::FormatStatic("Would panic on slice iteration"))
@@ -569,20 +575,25 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                             // tmp was only written partially, note that len is in ZigZag order.
                             clobber_more_than_4x4 = len > 10;
 
+                            // An upsampling inverse DCT writes 8 * scale samples per block.
+                            let (h_scale, v_scale) =
+                                (component.idct_h_scale, component.idct_v_scale);
                             let idct_position = if PROGRESSIVE {
                                 // For non-interleaved, j indexes data units directly
-                                j * 8
+                                j * 8 * h_scale
                             } else {
                                 // derived from stb and rewritten for my tastes
-                                let c2 = v_samp * 8;
-                                let c3 = ((j * component.horizontal_sample) + h_samp) * 8;
+                                let c2 = v_samp * 8 * v_scale;
+                                let c3 = ((j * component.horizontal_sample) + h_samp) * 8 * h_scale;
 
                                 component.width_stride * c2 + c3
                             };
 
                             let idct_pos = channel.get_mut(idct_position..).unwrap();
 
-                            if len <= 1 {
+                            if h_scale * v_scale > 1 {
+                                idct_scaled(tmp, idct_pos, component.width_stride, h_scale, v_scale);
+                            } else if len <= 1 {
                                 (self.idct_1x1_func)(tmp, idct_pos, component.width_stride);
                             } else if len <= 10 {
                                 (self.idct_4x4_func)(tmp, idct_pos, component.width_stride);
@@ -609,7 +620,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     // strict mode changes.)
                     error!("Premature end of buffer");
                     for component in self.components.iter_mut().filter(|c| c.needed && c.width_stride > 0) {
-                        let start = (j + 1) * component.horizontal_sample * 8;
+                        let start = (j + 1) * component.horizontal_sample * component.idct_h_scale * 8;
                         for line in component.raw_coeff.chunks_exact_mut(component.width_stride) {
                             if let Some(rest) = line.get_mut(start..) {
                                 rest.fill(128);
