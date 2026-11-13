@@ -159,6 +159,10 @@ pub struct JpegDecoder<T> {
     pub(crate) extended_xmp_segments: Vec<ExtendedXmpSegment>,
     /// The most memory a decode may need, see [`JpegDecoder::set_max_memory`]
     pub(crate) max_memory: Option<usize>,
+    /// Whether to look for SOI past leading bytes, see [`JpegDecoder::set_skip_before_soi`]
+    pub(crate) skip_before_soi: bool,
+    /// The bytes skipped before SOI, see [`JpegDecoder::bytes_before_soi`]
+    pub(crate) bytes_before_soi: usize,
 }
 
 impl<T> JpegDecoder<T>
@@ -206,6 +210,8 @@ where
             coeff:             1,
             extended_xmp_segments: vec![],
             max_memory:        None,
+            skip_before_soi:   false,
+            bytes_before_soi:  0,
         }
     }
     /// Decode a buffer already in memory
@@ -243,6 +249,52 @@ where
     #[must_use]
     pub const fn max_memory(&self) -> Option<usize> {
         self.max_memory
+    }
+
+    /// Whether, in lenient mode, data that does not start with the SOI marker is searched for
+    /// one (default `false`)
+    ///
+    /// When set and strict mode is off, the decoder skips leading bytes up to the first
+    /// `FF D8` that is followed by another marker (`FF` and a byte other than `00`), and
+    /// [`bytes_before_soi`](Self::bytes_before_soi) says how many it skipped. Data without
+    /// such an SOI still fails with [`DecodeErrors::IllegalMagicBytes`]. In strict mode, and
+    /// when not set, data must start with SOI.
+    ///
+    /// Some files carry a JPEG image behind other bytes (a header of a container format, or
+    /// garbage); libjpeg-based readers decode those.
+    pub fn set_skip_before_soi(&mut self, skip: bool) {
+        self.skip_before_soi = skip;
+    }
+
+    /// The number of bytes skipped before the SOI marker (see
+    /// [`set_skip_before_soi`](Self::set_skip_before_soi)), once the headers are decoded; `0`
+    /// when the data starts with SOI
+    #[must_use]
+    pub const fn bytes_before_soi(&self) -> usize {
+        self.bytes_before_soi
+    }
+
+    /// Skips to the first SOI marker that is followed by another marker, where the data does
+    /// not start with SOI. The first two bytes, `magic_bytes`, have been read.
+    ///
+    /// # Returns
+    /// The number of bytes before that SOI; the stream is then right after it.
+    fn skip_to_soi(&mut self, magic_bytes: u16) -> Result<usize, DecodeErrors> {
+        let start = self.stream.position()?.saturating_sub(2);
+        let mut previous = magic_bytes.to_be_bytes()[1];
+        loop {
+            let Ok(byte) = self.stream.read_u8_err() else {
+                return Err(DecodeErrors::IllegalMagicBytes(magic_bytes));
+            };
+            if previous == 0xFF && byte == 0xD8 {
+                let next = self.stream.peek_at(0, 2).ok().map(|b| (b[0], b[1]));
+                if matches!(next, Some((0xFF, marker)) if marker != 0x00) {
+                    let soi = self.stream.position()?.saturating_sub(2);
+                    return Ok(usize::try_from(soi - start).unwrap_or(usize::MAX));
+                }
+            }
+            previous = byte;
+        }
     }
 
     /// An upper bound, in bytes, of the memory that decoding this image allocates, from its
@@ -545,7 +597,11 @@ where
         let mut bytes_before_marker = 0;
 
         if magic_bytes != 0xffd8 {
-            return Err(DecodeErrors::IllegalMagicBytes(magic_bytes));
+            if !self.skip_before_soi || self.options.strict_mode() {
+                return Err(DecodeErrors::IllegalMagicBytes(magic_bytes));
+            }
+            self.bytes_before_soi = self.skip_to_soi(magic_bytes)?;
+            warn!("Skipped {} bytes before the SOI marker", self.bytes_before_soi);
         }
 
         loop {
