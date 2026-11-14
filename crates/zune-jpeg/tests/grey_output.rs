@@ -7,10 +7,10 @@
  */
 
 //! A grey output (`ColorSpace::Luma`) of a colour frame whose chroma is subsampled vertically
-//! only (sampling factors 1×2, 1×1, 1×1), coded in more than one scan. For such an output the
-//! decoder buffers twice as many MCU rows as the frame has (it outputs two rows of blocks per
-//! MCU row); the frame's components must still be read and assembled one MCU row of the frame
-//! at a time, as for a colour output.
+//! only (sampling factors 1×2, 1×1, 1×1). For such an output the decoder outputs two rows of
+//! blocks per MCU row, the MCU's two luma block rows; the frame's components must still be read
+//! one MCU row of the frame at a time, as for a colour output, whether the frame is coded in one
+//! interleaved scan, in more than one scan or progressively.
 
 mod common;
 
@@ -91,6 +91,29 @@ fn expected_luma(width: u16, height: u16) -> Vec<u8> {
 }
 
 const SIZES: [(u16, u16); 3] = [(37, 23), (32, 32), (8, 16)];
+
+#[test]
+fn an_interleaved_frame_decodes_to_grey() {
+    for (width, height) in SIZES {
+        for strict in [true, false] {
+            for restart in [0, 1, 3] {
+                // The strict mode failed here (premature end of data, or a Huffman error when
+                // more bytes follow the scan): the scan was read for twice the frame's MCU rows.
+                let mut grey = grey_frame(width, height, Coding::Interleaved);
+                grey.restart = restart;
+                assert_grey_is_luma(&grey, strict);
+                let mut frame = frame(width, height, Coding::Interleaved);
+                frame.restart = restart;
+                let grey = assert_grey_is_luma(&frame, strict);
+                let expected = expected_luma(width, height);
+                if let Some(i) = first_difference(&grey, &expected) {
+                    let what = format!("{width}x{height} restart {restart} strict {strict}");
+                    panic!("{what}: wrong luma at sample {i}");
+                }
+            }
+        }
+    }
+}
 
 #[test]
 fn a_scan_per_component_decodes_to_grey() {

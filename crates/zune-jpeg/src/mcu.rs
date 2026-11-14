@@ -121,22 +121,14 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 || self.info.sample_ratio == SampleRatios::HV)
             && !self.grey_upsamples_first()
         {
-            // For a specific set of images, e.g interleaved,
-            // when converting from YcbCr to grayscale, we need to
-            // take into account mcu height since the MCU decoding needs to take
-            // it into account for padding purposes and the post processor
-            // parses two rows per mcu width.
+            // For a grey output of an interleaved frame whose luma has the largest sampling
+            // factors, the post processor outputs the luma samples without upsampling: an MCU
+            // holds `v_max` luma block rows, so set coeff to 2 to output both block rows of an
+            // MCU row (taken only when the largest sampling factors are 1×2 or 2×2).
             //
-            // set coeff to be 2 to ensure that we increment two rows
-            // for every mcu processed also
-            //
-            // Not when the components come in separate scans: each scan is decoded one MCU row
-            // of the frame at a time, `mcu_y` rows as for a colour output, and more rows would
-            // read past the end of the scan's data.
-            if all_components_in_first_scan {
-                mcu_height *= self.v_max;
-                mcu_height /= self.h_max;
-            }
+            // The scan is still decoded one MCU row of the frame at a time, `mcu_y` rows as for
+            // a colour output, whether it holds every component or not: more rows would read
+            // past the end of the scan's data, which the strict mode reports as an error.
             self.coeff = 2;
         }
 
