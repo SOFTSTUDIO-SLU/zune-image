@@ -718,13 +718,18 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
         // The bit reader may have read ahead to the marker after this scan while bits of the
         // scan's last rows are still buffered. A scan ends after its rows, so the next scan or
-        // a segment between scans waits until they are decoded. If the scan's data really ends
-        // there, its next MCU runs out of data and is reported as such.
+        // a segment between scans (tables, DNL) waits until they are decoded. If the scan's
+        // data really ends there, its next MCU runs out of data and is reported as such.
         if more_rows {
             if let Some(m) = stream.marker {
                 if matches!(
                     m,
-                    Marker::SOS | Marker::DHT | Marker::DQT | Marker::DRI | Marker::COM
+                    Marker::SOS
+                        | Marker::DHT
+                        | Marker::DQT
+                        | Marker::DRI
+                        | Marker::COM
+                        | Marker::DNL
                 ) || matches!(m, Marker::APP(_))
                 {
                     return Ok(McuContinuation::Ok);
@@ -771,8 +776,10 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 stream.reset();
                 trace!("Found SOS marker");
                 return Ok(McuContinuation::AnotherSos);
-            } else if matches!(m, Marker::DHT | Marker::DQT | Marker::DRI | Marker::COM)
-                || matches!(m, Marker::APP(_))
+            } else if matches!(
+                m,
+                Marker::DHT | Marker::DQT | Marker::DRI | Marker::COM | Marker::DNL
+            ) || matches!(m, Marker::APP(_))
             {
                 // For non-interleaved images, setup markers can appear between scans.
                 // Signal the caller to handle this marker and find the next SOS.
@@ -842,7 +849,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     trace!("Found EOI marker");
                     return Ok(false);
                 }
-                Marker::DHT | Marker::DQT | Marker::DRI | Marker::COM => {
+                Marker::DHT | Marker::DQT | Marker::DRI | Marker::COM | Marker::DNL => {
                     trace!("Parsing inter-scan marker {:?}", marker);
                     self.parse_marker_inner(marker)?;
                 }
@@ -896,7 +903,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 // Valid markers that can appear between scans at a restart boundary
                 // (restart interval aligns with end of scan). Leave for caller.
                 Marker::SOS | Marker::DHT | Marker::DQT | Marker::DRI | Marker::COM
-                | Marker::APP(_) => {}
+                | Marker::DNL | Marker::APP(_) => {}
                 _ => {
                     if self.options.strict_mode() {
                         return Err(DecodeErrors::MCUError(format!(

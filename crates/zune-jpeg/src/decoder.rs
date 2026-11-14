@@ -1014,6 +1014,26 @@ where
             }
             Marker::EOI => return Err(DecodeErrors::FormatStatic("Premature End of image")),
 
+            Marker::DNL if self.seen_sof => {
+                // ITU-T T.81 B.2.2 lets a frame header give 0 lines, and B.2.5 has a DNL
+                // segment after the first scan give the count then: a length of 4 and a
+                // two-byte line count. A frame header of 0 lines is refused when it is read
+                // (the output is sized from it), so here the frame has its count already and
+                // the segment adds nothing the decode needs: skip it, as libjpeg does.
+                let length = self.stream.get_u16_be_err()?;
+
+                if length == 4 {
+                    let lines = self.stream.get_u16_be_err()?;
+                    trace!("DNL segment: {} lines, frame header {}", lines, self.info.height);
+                } else if length < 2 || self.options.strict_mode() {
+                    return Err(DecodeErrors::Format(format!(
+                        "Bad DNL length {length}, Corrupt JPEG"
+                    )));
+                } else {
+                    warn!("DNL segment of length {}, skipping it", length);
+                    self.stream.skip((length - 2) as usize)?;
+                }
+            }
             Marker::DAC | Marker::DNL => {
                 return Err(DecodeErrors::Format(format!(
                     "Parsing of the following header `{m:?}` is not supported,\
