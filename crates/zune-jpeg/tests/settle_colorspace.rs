@@ -16,7 +16,7 @@ use common::color::{flat, Frame};
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
-use zune_jpeg::JpegDecoder;
+use zune_jpeg::{ColorTransform, JpegDecoder};
 
 /// A 16×16 frame without subsampling whose component `c` is flat with `60 + 50 * c`.
 fn frame(components: usize, adobe: Option<u8>) -> Frame {
@@ -87,5 +87,30 @@ fn an_adobe_ycck_flag_on_one_or_two_components_decodes_as_before_the_colour_chan
                 }
             }
         }
+    }
+}
+
+#[test]
+fn a_header_pass_whose_colour_space_fails_to_settle_leaves_no_headers() {
+    // Two components with an Adobe flag of 0 (CMYK) fail in strict mode; three components do
+    // not fit the YCCK transform.
+    let strict_cmyk = frame(2, Some(0)).encode();
+    let three = frame(3, None).encode();
+    let cases: [(&[u8], Option<ColorTransform>); 2] =
+        [(&strict_cmyk, None), (&three, Some(ColorTransform::YcckToCmyk))];
+    for (data, transform) in cases {
+        let mut decoder =
+            JpegDecoder::new_with_options(ZCursor::new(data), options(true, ColorSpace::RGB));
+        decoder.set_color_transform(transform);
+        assert!(decoder.decode_headers().is_err());
+        assert_eq!(decoder.input_colorspace(), None);
+        assert_eq!(decoder.estimated_memory(), None);
+        assert_eq!(decoder.adobe_transform(), None);
+        assert!(decoder.info().is_none());
+        assert_eq!(decoder.output_buffer_size(), None);
+        // A second header pass fails the same way, as does the decode.
+        assert!(decoder.decode_headers().is_err());
+        assert_eq!(decoder.input_colorspace(), None);
+        assert!(decoder.decode().is_err());
     }
 }

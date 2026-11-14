@@ -155,7 +155,13 @@ pub struct JpegDecoder<T> {
     // byte-stream
     pub(crate) stream:           ZReader<T>,
     // Indicate whether headers have been decoded
+    //
+    // Set once the markers up to the first scan are read and the colour space is settled
+    // under the current options and transform.
     pub(crate) headers_decoded:  bool,
+    /// Whether the markers up to the first scan have been read (the colour space may still
+    /// fail to settle)
+    pub(crate) headers_parsed:   bool,
     pub(crate) seen_sof:         bool,
 
     // exif data, lifted from app2
@@ -257,6 +263,7 @@ where
             options:           options,
             stream:            ZReader::new(buffer),
             headers_decoded:   false,
+            headers_parsed:    false,
             seen_sof:          false,
             icc_data:          vec![],
             is_mjpeg:          false,
@@ -378,6 +385,16 @@ where
     /// apply to the frame's component count.
     pub fn set_color_transform(&mut self, transform: Option<ColorTransform>) {
         self.color_transform = transform;
+    }
+
+    /// Settle the colour space once the markers are read; the headers count as decoded only
+    /// when it settles.
+    fn settle_headers(&mut self) -> Result<(), DecodeErrors> {
+        self.headers_decoded = false;
+        settle_input_colorspace(self)?;
+        self.headers_decoded = true;
+        trace!("Input colorspace {:?}", self.input_colorspace);
+        Ok(())
     }
 
     /// The transform set with [`set_color_transform`](Self::set_color_transform), if any
@@ -808,6 +825,11 @@ where
             )
             .unwrap();
         }
+        if self.headers_parsed {
+            // The markers were read, but the colour space did not settle: try again, under
+            // the options and transform as they are now.
+            return self.settle_headers();
+        }
         // First two bytes should be jpeg soi marker
         let magic_bytes = self.stream.get_u16_be_err()?;
 
@@ -878,13 +900,9 @@ where
                     // break after reading the start of scan.
                     // what follows is the image data
                     if n == Marker::SOS {
-                        self.headers_decoded = true;
-                        trace!("Input colorspace {:?}", self.input_colorspace);
-
+                        self.headers_parsed = true;
                         // The colour space the decode will use, so that callers see it.
-                        settle_input_colorspace(self)?;
-
-                        return Ok(());
+                        return self.settle_headers();
                     }
                 } else {
                     bytes_before_marker = 0;
