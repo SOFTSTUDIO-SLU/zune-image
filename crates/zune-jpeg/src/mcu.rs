@@ -717,9 +717,10 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         }
 
         // The bit reader may have read ahead to the marker after this scan while bits of the
-        // scan's last rows are still buffered. A scan that does not hold every component ends
-        // after its rows, so the next scan or table marker waits until they are decoded.
-        if PROGRESSIVE && more_rows {
+        // scan's last rows are still buffered. A scan ends after its rows, so the next scan or
+        // a segment between scans waits until they are decoded. If the scan's data really ends
+        // there, its next MCU runs out of data and is reported as such.
+        if more_rows {
             if let Some(m) = stream.marker {
                 if matches!(
                     m,
