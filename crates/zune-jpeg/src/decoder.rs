@@ -303,8 +303,10 @@ where
     /// When set and strict mode is off, the decoder skips leading bytes up to the first
     /// `FF D8` that is followed by another marker (`FF` and a byte other than `00`), and
     /// [`bytes_before_soi`](Self::bytes_before_soi) says how many it skipped. Data without
-    /// such an SOI still fails with [`DecodeErrors::IllegalMagicBytes`]. In strict mode, and
-    /// when not set, data must start with SOI.
+    /// such an SOI still fails with [`DecodeErrors::IllegalMagicBytes`]. A marker segment met
+    /// on the way (an APPn segment that carries a thumbnail, say) is passed over whole when its
+    /// length ends it right before another marker, so a damaged SOI does not make the decoder
+    /// return an embedded thumbnail. In strict mode, and when not set, data must start with SOI.
     ///
     /// Some files carry a JPEG image behind other bytes (a header of a container format, or
     /// garbage); libjpeg-based readers decode those.
@@ -407,11 +409,19 @@ where
     /// Skips to the first SOI marker that is followed by another marker, where the data does
     /// not start with SOI. The first two bytes, `magic_bytes`, have been read.
     ///
+    /// A marker segment met on the way is passed over whole when its length field ends it
+    /// right before another marker: an APPn segment (Exif, JFXX, Photoshop) can carry a whole
+    /// JPEG thumbnail, and when the image's own SOI is damaged, the thumbnail's SOI must not be
+    /// taken for the image's. A length that does not end on a marker is taken for stray bytes.
+    ///
     /// # Returns
     /// The number of bytes before that SOI; the stream is then right after it.
     fn skip_to_soi(&mut self, magic_bytes: u16) -> Result<usize, DecodeErrors> {
         let start = self.stream.position()?.saturating_sub(2);
-        let mut previous = magic_bytes.to_be_bytes()[1];
+        let [first, mut previous] = magic_bytes.to_be_bytes();
+        if first == 0xFF && self.skip_marker_segment(previous) {
+            previous = 0;
+        }
         loop {
             let Ok(byte) = self.stream.read_u8_err() else {
                 return Err(DecodeErrors::IllegalMagicBytes(magic_bytes));
@@ -423,8 +433,37 @@ where
                     return Ok(usize::try_from(soi - start).unwrap_or(usize::MAX));
                 }
             }
+            if previous == 0xFF && self.skip_marker_segment(byte) {
+                // The stream is at the marker after the segment.
+                previous = 0;
+                continue;
+            }
             previous = byte;
         }
+    }
+
+    /// In [`skip_to_soi`](Self::skip_to_soi), with the stream right after the marker `FF code`:
+    /// when `code` starts a segment with a length field (ITU-T T.81 B.1.1 and Table B.1: every
+    /// marker but SOI, EOI, RSTn and TEM; the reserved codes below C0 are left alone) and that
+    /// length ends
+    /// the segment right before another marker (`FF` and a byte other than `00`), skips to that
+    /// marker. Whether it skipped.
+    fn skip_marker_segment(&mut self, code: u8) -> bool {
+        if !matches!(code, 0xC0..=0xCF | 0xDA..=0xFE) {
+            return false;
+        }
+        let Ok(&[high, low]) = self.stream.peek_at(0, 2) else {
+            return false;
+        };
+        let length = usize::from(u16::from_be_bytes([high, low]));
+        if length < 2 {
+            return false;
+        }
+        let ends_on_marker = matches!(
+            self.stream.peek_at(length, 2),
+            Ok(&[0xFF, next]) if next != 0x00
+        );
+        ends_on_marker && self.stream.skip(length).is_ok()
     }
 
     /// An upper bound, in bytes, of the memory that decoding this image allocates, from its
