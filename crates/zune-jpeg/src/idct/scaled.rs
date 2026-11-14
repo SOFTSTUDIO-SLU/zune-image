@@ -82,8 +82,9 @@ pub fn idct_scaled(
 ) {
     let height = 8 * v_scale;
     if coefficients[1..].iter().all(|&c| c == 0) {
-        // A flat block: the DC term alone, F / 8, rounded half up.
-        let value = (128 + ((coefficients[0] + 4) >> 3)).clamp(0, 255) as i16;
+        // A flat block: the DC term alone, F / 8, rounded half up. The add wraps, as in the
+        // other inverse DCTs, since a damaged stream can bring the DC term near `i32::MAX`.
+        let value = (128 + (coefficients[0].wrapping_add(4) >> 3)).clamp(0, 255) as i16;
         for row in out.chunks_mut(stride).take(height) {
             row[..8 * h_scale].fill(value);
         }
@@ -250,6 +251,22 @@ mod tests {
         let mut out = [0i16; 256];
         idct_scaled(&coefficients, &mut out, 16, 2, 2);
         assert!(out.iter().all(|&s| s == 200));
+    }
+
+    #[test]
+    fn a_dc_term_near_the_limit_does_not_overflow() {
+        // A damaged stream can bring the DC term anywhere in `i32`; the flat path must not
+        // overflow (a panic in debug builds) and the block stays flat and in range.
+        for (dc, expected) in [(i32::MAX, 0), (i32::MAX - 3, 0), (i32::MAX - 4, 255), (i32::MIN, 0)] {
+            let mut coefficients = [0; 64];
+            coefficients[0] = dc;
+            for (h_scale, v_scale) in [(1, 1), (2, 2), (2, 1), (1, 2)] {
+                let (width, height) = (8 * h_scale, 8 * v_scale);
+                let mut out = vec![-1i16; width * height];
+                idct_scaled(&coefficients, &mut out, width, h_scale, v_scale);
+                assert!(out.iter().all(|&s| s == expected), "{dc}: {}", out[0]);
+            }
+        }
     }
 
     #[test]
