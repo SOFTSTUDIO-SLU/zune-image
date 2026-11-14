@@ -114,3 +114,57 @@ fn a_header_pass_whose_colour_space_fails_to_settle_leaves_no_headers() {
         assert!(decoder.decode().is_err());
     }
 }
+
+#[test]
+fn a_transform_that_fits_after_a_failed_header_pass_decodes() {
+    let data = frame(3, None).encode();
+    let mut decoder = JpegDecoder::new(ZCursor::new(&data[..]));
+    decoder.set_color_transform(Some(ColorTransform::YcckToCmyk));
+    assert!(decoder.decode_headers().is_err());
+    decoder.set_color_transform(Some(ColorTransform::None));
+    assert_eq!(decoder.input_colorspace(), Some(ColorSpace::RGB));
+    let samples = decoder.decode().unwrap();
+    for px in samples.chunks_exact(3) {
+        assert_eq!(px, [60, 110, 160]);
+    }
+}
+
+#[test]
+fn a_transform_reset_after_the_header_pass_gives_the_files_colour_space() {
+    let data = frame(3, None).encode();
+    let expected = JpegDecoder::new(ZCursor::new(&data[..])).decode().unwrap();
+
+    let mut decoder = JpegDecoder::new(ZCursor::new(&data[..]));
+    decoder.set_color_transform(Some(ColorTransform::None));
+    decoder.decode_headers().unwrap();
+    assert_eq!(decoder.input_colorspace(), Some(ColorSpace::RGB));
+    decoder.set_color_transform(None);
+    assert_eq!(decoder.input_colorspace(), Some(ColorSpace::YCbCr));
+    assert_eq!(decoder.decode().unwrap(), expected);
+
+    // And the other way round: the transform set after the header pass applies.
+    let mut decoder = JpegDecoder::new(ZCursor::new(&data[..]));
+    decoder.decode_headers().unwrap();
+    assert_eq!(decoder.input_colorspace(), Some(ColorSpace::YCbCr));
+    decoder.set_color_transform(Some(ColorTransform::None));
+    assert_eq!(decoder.input_colorspace(), Some(ColorSpace::RGB));
+    for px in decoder.decode().unwrap().chunks_exact(3) {
+        assert_eq!(px, [60, 110, 160]);
+    }
+}
+
+#[test]
+fn strict_mode_set_after_the_header_pass_applies_to_the_colour_space() {
+    // Two components with an Adobe flag of 0: MultiBand when lenient, an error when strict.
+    let data = frame(2, Some(0)).encode();
+    let mut decoder =
+        JpegDecoder::new_with_options(ZCursor::new(&data[..]), options(false, ColorSpace::RGB));
+    decoder.decode_headers().unwrap();
+    assert!(matches!(decoder.input_colorspace(), Some(ColorSpace::MultiBand(n)) if n.get() == 2));
+    decoder.set_options(options(true, ColorSpace::RGB));
+    assert_eq!(decoder.input_colorspace(), None);
+    assert!(decoder.decode().is_err());
+    // Lenient again: it settles as before.
+    decoder.set_options(options(false, ColorSpace::RGB));
+    assert!(matches!(decoder.input_colorspace(), Some(ColorSpace::MultiBand(n)) if n.get() == 2));
+}

@@ -382,9 +382,21 @@ where
     /// [`ColorTransform::YcckToCmyk`].
     ///
     /// Decoding the headers fails with [`DecodeErrors::Format`] when the transform does not
-    /// apply to the frame's component count.
+    /// apply to the frame's component count. After the header pass the colour space is
+    /// derived again from what the headers say; when the new transform does not apply,
+    /// [`input_colorspace`](Self::input_colorspace) and the other header accessors return
+    /// `None` and the decode fails.
     pub fn set_color_transform(&mut self, transform: Option<ColorTransform>) {
         self.color_transform = transform;
+        self.resettle();
+    }
+
+    /// Settle the colour space again after the options or the transform changed, once the
+    /// markers have been read: `headers_decoded` says whether it settled.
+    fn resettle(&mut self) {
+        if self.headers_parsed {
+            self.headers_decoded = settle_input_colorspace(self).is_ok();
+        }
     }
 
     /// Settle the colour space once the markers are read; the headers count as decoded only
@@ -720,6 +732,9 @@ where
     ///
     /// This does not bear any significance after decoding an image
     ///
+    /// After the header pass the colour space is derived again under the new options (strict
+    /// mode decides whether a colour space with more components than the frame fails).
+    ///
     /// # Arguments
     /// - `options`: New decoder options
     ///
@@ -739,6 +754,7 @@ where
     /// ```
     pub fn set_options(&mut self, options: DecoderOptions) {
         self.options = options;
+        self.resettle();
     }
     fn reassemble_extended_xmp(&mut self) {
         if self.extended_xmp_segments.is_empty() {
