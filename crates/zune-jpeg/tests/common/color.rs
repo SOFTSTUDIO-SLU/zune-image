@@ -57,7 +57,23 @@ pub struct Frame {
     pub components: Vec<Component>,
     /// The transform byte of an Adobe APP14 segment, if the file has one.
     pub adobe:      Option<u8>,
-    pub coding:     Coding
+    pub coding:     Coding,
+    /// MCUs per restart interval (blocks, in a scan of one component), or 0 for none.
+    pub restart:    u16
+}
+
+/// Where a test cuts the entropy-coded data of a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cut {
+    /// The whole file.
+    None,
+    /// Scan `scan` (0 is the first) keeps the first `keep` bytes of its data (before byte
+    /// stuffing, restart markers not counted), and the file ends there: with EOI if `eoi`,
+    /// otherwise right after the last byte kept.
+    End { scan: usize, keep: usize, eoi: bool },
+    /// Restart interval `interval` of scan `scan` keeps the first `keep` bytes of its data; the
+    /// rest of the file follows.
+    Interval { scan: usize, interval: usize, keep: usize }
 }
 
 /// The coefficients of a flat block of `value`.
@@ -76,7 +92,8 @@ impl Frame {
             height,
             components: Vec::new(),
             adobe: None,
-            coding: Coding::Interleaved
+            coding: Coding::Interleaved,
+            restart: 0
         };
         for &(id, h, v) in layout {
             frame.components.push(Component {
@@ -123,6 +140,11 @@ impl Frame {
 
     /// The whole file.
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_cut(Cut::None)
+    }
+
+    /// The file with its entropy-coded data cut as `cut` says.
+    pub fn encode_cut(&self, cut: Cut) -> Vec<u8> {
         let mut out = vec![0xFF, 0xD8];
 
         if let Some(transform) = self.adobe {
@@ -159,27 +181,44 @@ impl Frame {
         ac.extend(&symbols);
         segment(&mut out, 0xC4, &ac);
 
+        if self.restart > 0 {
+            segment(&mut out, 0xDD, &self.restart.to_be_bytes());
+        }
+
         let all: Vec<usize> = (0..self.components.len()).collect();
+        let mut scans: Vec<(Vec<usize>, Band)> = Vec::new();
         match self.coding {
-            Coding::Interleaved => self.scan(&mut out, &all, Band::Both, &symbols),
+            Coding::Interleaved => scans.push((all, Band::Both)),
             Coding::ScanPerComponent => {
                 for c in all {
-                    self.scan(&mut out, &[c], Band::Both, &symbols);
+                    scans.push((vec![c], Band::Both));
                 }
             }
             Coding::Progressive => {
-                self.scan(&mut out, &all, Band::Dc, &symbols);
+                scans.push((all.clone(), Band::Dc));
                 for c in all {
-                    self.scan(&mut out, &[c], Band::Ac, &symbols);
+                    scans.push((vec![c], Band::Ac));
                 }
+            }
+        }
+        for (n, (components, band)) in scans.iter().enumerate() {
+            if !self.scan(&mut out, components, *band, &symbols, n, cut) {
+                if matches!(cut, Cut::End { eoi: false, .. }) {
+                    return out;
+                }
+                break;
             }
         }
         out.extend([0xFF, 0xD9]);
         out
     }
 
-    /// One scan of `components` (indexes) over `band`, header and data.
-    fn scan(&self, out: &mut Vec<u8>, components: &[usize], band: Band, ac_symbols: &[u8]) {
+    /// One scan of `components` (indexes) over `band`, header and data; the scan is number
+    /// `n`, cut as `cut` says. Whether the file goes on after it.
+    fn scan(
+        &self, out: &mut Vec<u8>, components: &[usize], band: Band, ac_symbols: &[u8], n: usize,
+        cut: Cut
+    ) -> bool {
         let mut sos = vec![components.len() as u8];
         for &c in components {
             sos.extend([self.components[c].id, 0x00]);
@@ -192,18 +231,8 @@ impl Frame {
         sos.extend([ss, se, 0]);
         segment(out, 0xDA, &sos);
 
-        let mut bits = Vec::new();
-        let mut predictions = vec![0i32; self.components.len()];
-        let mut code = |bits: &mut Vec<bool>, c: usize, bx: usize, by: usize| {
-            let (wide, _) = self.grid(c);
-            let block = &self.components[c].blocks[by * wide + bx];
-            if band != Band::Ac {
-                dc_bits(bits, block, &mut predictions[c]);
-            }
-            if band != Band::Dc {
-                ac_bits(bits, block, ac_symbols);
-            }
-        };
+        // The units of the scan (a block, or an MCU's blocks), each a list of (component, bx, by).
+        let mut units: Vec<Vec<(usize, usize, usize)>> = Vec::new();
         if components.len() == 1 {
             // A scan of one component covers its own blocks, not whole MCUs.
             let c = components[0];
@@ -213,32 +242,72 @@ impl Frame {
             let high = (usize::from(self.height) * usize::from(comp.v)).div_ceil(v_max).div_ceil(8);
             for by in 0..high {
                 for bx in 0..wide {
-                    code(&mut bits, c, bx, by);
+                    units.push(vec![(c, bx, by)]);
                 }
             }
         } else {
             let (mcus_x, mcus_y) = self.mcus();
             for my in 0..mcus_y {
                 for mx in 0..mcus_x {
+                    let mut unit = Vec::new();
                     for &c in components {
                         let comp = &self.components[c];
                         for v in 0..usize::from(comp.v) {
                             for h in 0..usize::from(comp.h) {
                                 let bx = mx * usize::from(comp.h) + h;
                                 let by = my * usize::from(comp.v) + v;
-                                code(&mut bits, c, bx, by);
+                                unit.push((c, bx, by));
                             }
                         }
                     }
+                    units.push(unit);
                 }
             }
         }
-        for b in pack(&bits) {
-            out.push(b);
-            if b == 0xFF {
-                out.push(0x00);
+
+        let interval = match self.restart {
+            0 => units.len(),
+            r => usize::from(r)
+        };
+        // Data bytes written so far, for a cut that ends the file in this scan.
+        let mut written = 0;
+        for (i, chunk) in units.chunks(interval).enumerate() {
+            if i > 0 {
+                out.extend([0xFF, 0xD0 + ((i - 1) % 8) as u8]);
+            }
+            // The DC prediction starts at 0 in every interval.
+            let mut predictions = vec![0i32; self.components.len()];
+            let mut bits = Vec::new();
+            for &(c, bx, by) in chunk.iter().flatten() {
+                let (wide, _) = self.grid(c);
+                let block = &self.components[c].blocks[by * wide + bx];
+                if band != Band::Ac {
+                    dc_bits(&mut bits, block, &mut predictions[c]);
+                }
+                if band != Band::Dc {
+                    ac_bits(&mut bits, block, ac_symbols);
+                }
+            }
+            let mut bytes = pack(&bits);
+            if let Cut::Interval { scan, interval, keep } = cut {
+                if scan == n && interval == i {
+                    bytes.truncate(keep);
+                }
+            }
+            for b in bytes {
+                if let Cut::End { scan, keep, .. } = cut {
+                    if scan == n && written == keep {
+                        return false;
+                    }
+                }
+                written += 1;
+                out.push(b);
+                if b == 0xFF {
+                    out.push(0x00);
+                }
             }
         }
+        !matches!(cut, Cut::End { scan, .. } if scan == n)
     }
 }
 

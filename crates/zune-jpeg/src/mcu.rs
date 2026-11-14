@@ -216,6 +216,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     };
 
                     error!("Premature end of buffer");
+                    self.ran_out_of_data = true;
                     break;
                 }
 
@@ -487,6 +488,24 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         }
 
         for j in 0..scan_du_width {
+            if !PROGRESSIVE && stream.padding_consumed() {
+                // Lenient mode: the restart interval ran out of data in an earlier MCU (see
+                // below), and a restart marker follows. As libjpeg does, the MCUs up to that
+                // marker get all coefficients zero, samples 128; decoding resumes after it.
+                for component in self.components.iter_mut().filter(|c| c.needed && c.width_stride > 0) {
+                    let width = component.horizontal_sample * component.idct_h_scale * 8;
+                    for line in component.raw_coeff.chunks_exact_mut(component.width_stride) {
+                        if let Some(mcu) = line.get_mut(j * width..).and_then(|l| l.get_mut(..width)) {
+                            mcu.fill(128);
+                        }
+                    }
+                }
+                self.todo = self.todo.wrapping_sub(1);
+                if self.todo == 0 {
+                    self.handle_rst_main(stream)?;
+                }
+                continue;
+            }
             // iterate over components
             for &k in z_scans {
                 // we made this loop body massive due to several different paths that depend on
@@ -625,7 +644,10 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 if self.options.strict_mode() {
                     return Err(DecodeErrors::FormatStatic("Premature end of buffer"));
                 }
-                if !PROGRESSIVE {
+                self.ran_out_of_data = true;
+                let restart_follows =
+                    self.restart_interval != 0 && matches!(stream.marker, Some(Marker::RST(_)));
+                if !PROGRESSIVE && !restart_follows {
                     // As libjpeg does: this MCU stays as decoded, and the MCUs after it have
                     // all coefficients zero, samples 128. Counted as an over-read, so that the
                     // next row's check fills the rest of the image with 128 and stops. (A scan

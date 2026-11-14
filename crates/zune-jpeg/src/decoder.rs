@@ -163,6 +163,8 @@ pub struct JpegDecoder<T> {
     pub(crate) skip_before_soi: bool,
     /// The bytes skipped before SOI, see [`JpegDecoder::bytes_before_soi`]
     pub(crate) bytes_before_soi: usize,
+    /// Whether a scan ran out of data, see [`JpegDecoder::ran_out_of_data`]
+    pub(crate) ran_out_of_data: bool,
     /// The transform byte of the last Adobe APP14 segment, see [`JpegDecoder::adobe_transform`]
     pub(crate) adobe_transform: Option<u8>,
     /// The caller's colour transform, see [`JpegDecoder::set_color_transform`]
@@ -255,6 +257,7 @@ where
             max_memory:        None,
             skip_before_soi:   false,
             bytes_before_soi:  0,
+            ran_out_of_data:   false,
             adobe_transform:   None,
             color_transform:   None,
             idct_upsampling:   false,
@@ -320,6 +323,20 @@ where
     #[must_use]
     pub const fn bytes_before_soi(&self) -> usize {
         self.bytes_before_soi
+    }
+
+    /// Whether, in lenient mode, a scan ran out of data before its last block, once the image
+    /// is decoded
+    ///
+    /// The entropy-coded data of the scan ended (at a marker, or at the end of the data) while
+    /// blocks were still to be decoded. Strict mode fails with "Premature end of buffer"
+    /// instead. In lenient mode a sequential image gets samples of 128 from the block that ran
+    /// out on, as libjpeg gives; in a progressive image the blocks up to the next restart marker
+    /// keep what the earlier scans gave them, as libjpeg does. Either way the image is not
+    /// complete, and a caller can say so.
+    #[must_use]
+    pub const fn ran_out_of_data(&self) -> bool {
+        self.ran_out_of_data
     }
 
     /// The transform byte of the Adobe APP14 segment (0, 1 or 2), when the headers had one

@@ -193,9 +193,13 @@ impl BitStream {
         /// to full refill
         macro_rules! refill {
             ($buffer:expr,$byte:expr,$bits_left:expr) => {
-                // read a byte from the stream
+                // read a byte from the stream (a zero byte once the data has ended: padding)
+                let at_end = reader.eof()?;
                 $byte = u64::from(reader.read_u8());
                 self.overread_by += usize::from(reader.eof()?);
+                if at_end {
+                    self.padded_bits += 8;
+                }
                 // append to the buffer
                 // JPEG is a MSB type buffer so that means we append this
                 // to the lower end (0..8) of the buffer and push the rest bits above..
@@ -231,6 +235,15 @@ impl BitStream {
                             if next_byte == 0xD9 {
                                 // special handling for eoi, fill some bytes,even if its zero,
                                 // removes some panics
+                                self.buffer <<= 8;
+                                self.bits_left += 8;
+                                self.padded_bits += 8;
+                                self.aligned_buffer = self.buffer << (64 - self.bits_left);
+                            }
+                            // Zero bits after any marker, as the next call gives them (see
+                            // below): the caller may need up to 32 bits for this value, and
+                            // reading past `bits_left` would take bits the buffer does not hold.
+                            while self.bits_left < 32 {
                                 self.buffer <<= 8;
                                 self.bits_left += 8;
                                 self.padded_bits += 8;

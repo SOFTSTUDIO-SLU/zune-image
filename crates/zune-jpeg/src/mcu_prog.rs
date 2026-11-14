@@ -122,10 +122,13 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         }
 
         // extract marker
-        let mut marker = stream
-            .marker
-            .take()
-            .ok_or(DecodeErrors::FormatStatic("Marker missing where expected"))?;
+        let Some(mut marker) = stream.marker.take() else {
+            if self.ran_out_of_data {
+                // Lenient mode: the data ended in the first scan, without a marker.
+                return self.finish_progressive_decoding(&block, pixels);
+            }
+            return Err(DecodeErrors::FormatStatic("Marker missing where expected"));
+        };
 
         // if marker is EOI, we are done, otherwise continue scanning.
         //
@@ -133,9 +136,17 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         // an error, depending on the strictness of the decoder, so there
         // is that logic to handle too
         'eoi: while marker != Marker::EOI {
+            // Once a scan has run out of data (lenient mode), what follows it is damaged too:
+            // a segment that does not parse ends the decode with what was decoded.
             match marker {
                 Marker::SOS => {
-                    parse_sos(self)?;
+                    if let Err(e) = parse_sos(self) {
+                        if self.ran_out_of_data {
+                            error!("{:?}", e);
+                            break 'eoi;
+                        }
+                        return Err(e);
+                    }
 
                     stream.update_progressive_params(
                         self.succ_high,
@@ -185,7 +196,13 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     self.handle_rst(&mut stream)?;
                 }
                 _ => {
-                    self.parse_marker_inner(marker)?;
+                    if let Err(e) = self.parse_marker_inner(marker) {
+                        if self.ran_out_of_data {
+                            error!("{:?}", e);
+                            break 'eoi;
+                        }
+                        return Err(e);
+                    }
                 }
             }
 
@@ -255,6 +272,12 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
             for i in 0..mcu_height {
                 for j in 0..mcu_width {
+                    if stream.padding_consumed() {
+                        // The data ran out in an earlier block (see check_ran_out).
+                        self.todo -= 1;
+                        self.handle_rst_main(stream)?;
+                        continue;
+                    }
                     if self.spec_start != 0 && self.succ_high == 0 && stream.eob_run > 0 {
                         // handle EOB runs here.
                         stream.eob_run -= 1;
@@ -329,6 +352,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         }
                     }
 
+                    self.check_ran_out(stream)?;
+
                     // + EOB and investigate effect.
                     self.todo -= 1;
 
@@ -378,6 +403,12 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             // the DC coefficients in the first scan for each component of a progressive frame.
             for i in 0..self.mcu_y {
                 for j in 0..self.mcu_x {
+                    if stream.padding_consumed() {
+                        // The data ran out in an earlier MCU (see check_ran_out).
+                        self.todo -= 1;
+                        self.handle_rst_main(stream)?;
+                        continue;
+                    }
                     // process scan n elements in order
                     for k in 0..self.num_scans {
                         let n = self.z_order[k as usize];
@@ -417,6 +448,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                             }
                         }
                     }
+                    self.check_ran_out(stream)?;
+
                     // We want wrapping subtraction here because it means
                     // we get a higher number in the case this underflows
                     self.todo -= 1;
@@ -426,6 +459,26 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             }
         }
         return Ok(());
+    }
+
+    /// After a block (an MCU in an interleaved scan) of a progressive scan, before a restart
+    /// marker resets the stream: whether the scan ran out of data in it, that is, used zero bits
+    /// padded in after a marker ended the entropy-coded data.
+    ///
+    /// Strict mode fails with "Premature end of buffer". Lenient mode records it
+    /// ([`JpegDecoder::ran_out_of_data`]) and keeps the block as decoded; the loops then skip the
+    /// blocks up to the next restart marker (to the end of the scan without one), which keep
+    /// what the earlier scans gave them. libjpeg does the same: once a scan's data runs out, it
+    /// leaves the coefficients alone until the next restart marker.
+    fn check_ran_out(&mut self, stream: &BitStream) -> Result<(), DecodeErrors> {
+        if stream.padding_consumed() {
+            if self.options.strict_mode() {
+                return Err(DecodeErrors::FormatStatic("Premature end of buffer"));
+            }
+            error!("Premature end of buffer in a progressive scan");
+            self.ran_out_of_data = true;
+        }
+        Ok(())
     }
 
     pub(crate) fn handle_rst_main(&mut self, stream: &mut BitStream) -> Result<(), DecodeErrors> {
