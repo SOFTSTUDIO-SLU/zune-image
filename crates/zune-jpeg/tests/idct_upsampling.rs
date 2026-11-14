@@ -87,11 +87,6 @@ fn chroma_subsampled_by_two_keeps_its_blocks() {
             [(1, 2), (1, 1), (1, 1)],
             [(2, 2), (2, 1), (1, 1)]
         ] {
-            // A scan per component of a vertically subsampled frame reads the wrong blocks in
-            // this decoder with or without the option (a separate bug).
-            if coding == Coding::ScanPerComponent && factors[0].1 == 2 {
-                continue;
-            }
             for (width, height) in [(32, 32), (37, 21), (8, 8)] {
                 assert_blocks_kept(width, height, factors, coding);
             }

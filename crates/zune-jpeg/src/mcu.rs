@@ -208,7 +208,20 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
             trace!("Decoding MCU width: {mcu_width}, height: {mcu_height}");
 
-            for i in 0..mcu_height {
+            // A scan of one component is not interleaved: its MCU is one block, and its blocks
+            // run in rows over the component's own block grid, ceil(Yi / 8) rows for a
+            // component of Yi = ceil(Y * Vi / Vmax) lines (ITU-T T.81 A.1.1 and A.2.2).
+            // `decode_mcu_width` decodes one block row of such a scan per call, so a
+            // component with a vertical factor above 1 takes more calls than the frame has MCU
+            // rows.
+            let rows = if all_components_in_first_scan || self.num_scans != 1 {
+                mcu_height
+            } else {
+                let component = &self.components[self.z_order[0]];
+                (usize::from(self.info.height) * component.vertical_sample).div_ceil(8 * self.v_max)
+            };
+
+            for i in 0..rows {
                 if stream.overread_by > 0 {
                     pixels.get_mut(pixels_written..).map(|v| v.fill(128));
                     if self.options.strict_mode() {
@@ -226,6 +239,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     self.decode_mcu_width::<false>(
                         mcu_width,
                         i,
+                        i + 1 < rows,
                         &mut tmp,
                         &mut stream,
                         &mut progressive_mcus
@@ -251,6 +265,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     self.decode_mcu_width::<true>(
                         mcu_width,
                         i,
+                        i + 1 < rows,
                         &mut tmp,
                         &mut stream,
                         &mut progressive_mcus
@@ -412,7 +427,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     }
 
     fn decode_mcu_width<const PROGRESSIVE: bool>(
-        &mut self, mcu_width: usize, mcu_height: usize, tmp: &mut [i32; 64],
+        &mut self, mcu_width: usize, mcu_height: usize, more_rows: bool, tmp: &mut [i32; 64],
         stream: &mut BitStream, progressive: &mut [Vec<i16>; 4]
     ) -> Result<McuContinuation, DecodeErrors> {
         let is_one_by_one = !self.scan_subsampled;
@@ -430,6 +445,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             self.inner_decode_mcu_width::<PROGRESSIVE, false>(
                 mcu_width,
                 mcu_height,
+                more_rows,
                 tmp,
                 stream,
                 progressive
@@ -438,6 +454,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             self.inner_decode_mcu_width::<PROGRESSIVE, true>(
                 mcu_width,
                 mcu_height,
+                more_rows,
                 tmp,
                 stream,
                 progressive
@@ -451,7 +468,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     // when `not SAMPLED` then the inner loop has exactly one iteration per component in
     // the scan. The difference was ~1% or a bit more.
     fn inner_decode_mcu_width<const PROGRESSIVE: bool, const SAMPLED: bool>(
-        &mut self, mcu_width: usize, mcu_height: usize, tmp: &mut [i32; 64],
+        &mut self, mcu_width: usize, mcu_height: usize, more_rows: bool, tmp: &mut [i32; 64],
         stream: &mut BitStream, progressive: &mut [Vec<i16>; 4]
     ) -> Result<McuContinuation, DecodeErrors> {
         let z_order = self.z_order;
@@ -525,10 +542,13 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
                 let qt_table = &component.quantization_table;
                 let channel = if PROGRESSIVE {
+                    // `mcu_height` is the row: a block row in a scan of one component, an MCU
+                    // row (`vertical_sample` block rows) otherwise.
+                    let block_rows = if z_scans.len() == 1 { 1 } else { component.vertical_sample };
                     let offset = mcu_height
                         * component.width_stride
                         * 8
-                        * component.vertical_sample
+                        * block_rows
                         * component.idct_v_scale;
                     // Small stopgap for https://github.com/etemesi254/zune-image/issues/362
                     if offset >= progressive[k].len(){
@@ -676,6 +696,21 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
             if stream.marker.is_some() && stream.bits_left == 0 {
                 break;
+            }
+        }
+
+        // The bit reader may have read ahead to the marker after this scan while bits of the
+        // scan's last rows are still buffered. A scan that does not hold every component ends
+        // after its rows, so the next scan or table marker waits until they are decoded.
+        if PROGRESSIVE && more_rows {
+            if let Some(m) = stream.marker {
+                if matches!(
+                    m,
+                    Marker::SOS | Marker::DHT | Marker::DQT | Marker::DRI | Marker::COM
+                ) || matches!(m, Marker::APP(_))
+                {
+                    return Ok(McuContinuation::Ok);
+                }
             }
         }
 
