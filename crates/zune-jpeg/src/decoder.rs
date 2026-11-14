@@ -108,7 +108,14 @@ pub struct JpegDecoder<T> {
     pub(crate) is_interleaved:    bool,
     /// Image input colorspace, should be YCbCr for a sane image, might be
     /// grayscale too
+    ///
+    /// The settled colour space the decode converts from, derived from
+    /// `header_colorspace`, the components and the options by
+    /// [`settle_input_colorspace`]
     pub(crate) input_colorspace:  ColorSpace,
+    /// The colour space the frame header and the Adobe APP14 marker indicate, as the markers
+    /// left it; only the header parsers write it
+    pub(crate) header_colorspace: ColorSpace,
     // Progressive image details
     /// Is the image progressive?
     pub(crate) is_progressive:    bool,
@@ -243,6 +250,7 @@ where
             idct_1x1_func:     choose_idct_1x1_func(&options),
             color_convert_16:  color_convert,
             input_colorspace:  ColorSpace::YCbCr,
+            header_colorspace: ColorSpace::YCbCr,
             z_order:           [0; MAX_COMPONENTS],
             restart_interval:  0,
             todo:              0x7fff_ffff,
@@ -873,28 +881,6 @@ where
                         self.headers_decoded = true;
                         trace!("Input colorspace {:?}", self.input_colorspace);
 
-                        // Check if image is RGB
-                        // The check is weird, we need to check if ID
-                        // represents R, G and B in ascii,
-                        //
-                        // I am not sure if this is even specified in any standard,
-                        // but jpegli https://github.com/google/jpegli does encode
-                        // its images that way, so this will check for that. and handle it appropriately
-                        // It is spefified here so that on a successful header decode,we can at least
-                        // try to attribute image colorspace  correctly.
-                        //
-                        // It was first the issue in https://github.com/etemesi254/zune-image/issues/291
-                        // that brought it to light
-                        //
-                        let mut is_rgb = self.components.len() == 3;
-                        let chars = ['R', 'G', 'B'];
-                        for (comp, single_char) in self.components.iter().zip(chars.iter()) {
-                            is_rgb &= comp.id == (*single_char) as u8
-                        }
-                        // Image is RGB, change colorspace
-                        if is_rgb {
-                            self.input_colorspace = ColorSpace::RGB;
-                        }
                         // The colour space the decode will use, so that callers see it.
                         settle_input_colorspace(self)?;
 

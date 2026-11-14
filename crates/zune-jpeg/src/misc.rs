@@ -203,14 +203,48 @@ pub(crate) fn try_zeroed_vec<T: Copy + Default>(len: usize) -> Result<Vec<T>, De
 /// one is set, otherwise the decoder's rules, which may leave a provisional colour space while
 /// the markers are read (the Adobe APP14 marker comes before or after the frame header).
 ///
-/// Runs at the end of the header pass, so that `input_colorspace()` reports what the decode
-/// uses, and again when the decode starts; it changes nothing the second time.
+/// It derives `input_colorspace` from what the headers say (`header_colorspace`, which only
+/// the header parsers write), the components, the options and the transform, so it gives the
+/// same result however often it runs: at the end of the header pass, so that
+/// `input_colorspace()` reports what the decode uses, again when the decode starts, and after
+/// the options or the transform change.
 pub(crate) fn settle_input_colorspace<T: ZByteReaderTrait>(
     img: &mut JpegDecoder<T>
 ) -> Result<(), DecodeErrors> {
+    img.input_colorspace = settled_input_colorspace(img)?;
+    Ok(())
+}
+
+/// The colour space [`settle_input_colorspace`] settles on, or the error it fails with.
+fn settled_input_colorspace<T: ZByteReaderTrait>(
+    img: &JpegDecoder<T>
+) -> Result<ColorSpace, DecodeErrors> {
     if let Some(transform) = img.color_transform {
-        img.input_colorspace = transform.input_colorspace(img.components.len())?;
-        return Ok(());
+        return transform.input_colorspace(img.components.len());
+    }
+    let mut colorspace = img.header_colorspace;
+
+    // Check if image is RGB
+    // The check is weird, we need to check if ID
+    // represents R, G and B in ascii,
+    //
+    // I am not sure if this is even specified in any standard,
+    // but jpegli https://github.com/google/jpegli does encode
+    // its images that way, so this will check for that. and handle it appropriately
+    // It is spefified here so that on a successful header decode,we can at least
+    // try to attribute image colorspace  correctly.
+    //
+    // It was first the issue in https://github.com/etemesi254/zune-image/issues/291
+    // that brought it to light
+    //
+    let mut is_rgb = img.components.len() == 3;
+    let chars = ['R', 'G', 'B'];
+    for (comp, single_char) in img.components.iter().zip(chars.iter()) {
+        is_rgb &= comp.id == (*single_char) as u8;
+    }
+    // Image is RGB, change colorspace
+    if is_rgb {
+        colorspace = ColorSpace::RGB;
     }
     // in case of adobe app14 being present, zero may indicate
     // either CMYK if components are 4 or RGB if components are 3,
@@ -221,13 +255,13 @@ pub(crate) fn settle_input_colorspace<T: ZByteReaderTrait>(
     //
     // We know adobe app14 was present since it's the only one that can modify
     // input colorspace to be CMYK
-    if img.components.len() == 3 && img.input_colorspace == ColorSpace::CMYK {
-        img.input_colorspace = ColorSpace::RGB;
+    if img.components.len() == 3 && colorspace == ColorSpace::CMYK {
+        colorspace = ColorSpace::RGB;
     }
 
     // check colorspace matches
-    if img.input_colorspace.num_components() > img.components.len() {
-        if img.input_colorspace == ColorSpace::YCCK {
+    if colorspace.num_components() > img.components.len() {
+        if colorspace == ColorSpace::YCCK {
             // Some images may have YCCK format (from adobe app14 segment) which is supposed to be 4 components
             // but only 3 components, see issue https://github.com/etemesi254/zune-image/issues/275
             // So this is the behaviour of other decoders
@@ -236,7 +270,7 @@ pub(crate) fn settle_input_colorspace<T: ZByteReaderTrait>(
             // it as YCbCr
             // So I will match that to match existing ones
             warn!("Treating YCCK colorspace as YCbCr as component length does not match");
-            img.input_colorspace = ColorSpace::YCbCr
+            colorspace = ColorSpace::YCbCr
         } else {
             // Note, translated this to a warning to handle valid images of the sort
             // See https://github.com/etemesi254/zune-image/issues/288 where there
@@ -249,7 +283,7 @@ pub(crate) fn settle_input_colorspace<T: ZByteReaderTrait>(
             if !img.options.strict_mode() {
                 warn!(
                     "Expected {} number of components but found {}",
-                    img.input_colorspace.num_components(),
+                    colorspace.num_components(),
                     img.components.len()
                 );
                 warn!("Defaulting to multisample to decode");
@@ -258,14 +292,14 @@ pub(crate) fn settle_input_colorspace<T: ZByteReaderTrait>(
                 // is the best option since I am not aware of grayscale+alpha which is the most common
                 // two band format in jpeg.
                 if img.components.len() > 0 {
-                    img.input_colorspace = ColorSpace::MultiBand(
+                    colorspace = ColorSpace::MultiBand(
                         NonZeroU32::new(img.components.len() as u32).unwrap()
                     );
                 }
             } else {
                 let msg = format!(
                     "Expected {} number of components but found {}",
-                    img.input_colorspace.num_components(),
+                    colorspace.num_components(),
                     img.components.len()
                 );
 
@@ -273,7 +307,7 @@ pub(crate) fn settle_input_colorspace<T: ZByteReaderTrait>(
             }
         }
     }
-    Ok(())
+    Ok(colorspace)
 }
 
 /// Set up component parameters.

@@ -248,14 +248,14 @@ pub(crate) fn parse_start_of_frame<T: ZByteReaderTrait>(
         // SOF sets the number of image components
         // and that to us translates to setting input and output
         // colorspaces to zero
-        img.input_colorspace = ColorSpace::Luma;
+        img.header_colorspace = ColorSpace::Luma;
         //img.options = img.options.jpeg_set_out_colorspace(ColorSpace::Luma);
         debug!("Overriding default colorspace set to Luma");
     }
-    if num_components == 4 && img.input_colorspace == ColorSpace::YCbCr {
+    if num_components == 4 && img.header_colorspace == ColorSpace::YCbCr {
         trace!("Input image has 4 components, defaulting to CMYK colorspace");
         // https://entropymine.wordpress.com/2018/10/22/how-is-a-jpeg-images-color-type-determined/
-        img.input_colorspace = ColorSpace::CMYK;
+        img.header_colorspace = ColorSpace::CMYK;
     }
 
     // set number of components
@@ -497,9 +497,9 @@ pub(crate) fn parse_app14<T: ZByteReaderTrait>(
         decoder.adobe_transform = Some(transform);
         // https://exiftool.org/TagNames/JPEG.html#Adobe
         match transform {
-            0 => decoder.input_colorspace = ColorSpace::CMYK,
-            1 => decoder.input_colorspace = ColorSpace::YCbCr,
-            2 => decoder.input_colorspace = ColorSpace::YCCK,
+            0 => decoder.header_colorspace = ColorSpace::CMYK,
+            1 => decoder.header_colorspace = ColorSpace::YCbCr,
+            2 => decoder.header_colorspace = ColorSpace::YCCK,
             _ => {
                 return Err(DecodeErrors::Format(format!(
                     "Unknown Adobe colorspace {transform}"
