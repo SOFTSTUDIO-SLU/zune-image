@@ -167,3 +167,33 @@ fn a_later_component_with_larger_factors_decodes() {
     }
     assert!(all.is_empty(), "{} failures:\n{}", all.len(), all.join("\n"));
 }
+
+/// Every layout of the factors 1, 2 and 4 in which each component's factors divide the largest
+/// ones, in every coding: with the samples as stored, every sample is its block's value. (A
+/// component's samples are upsampled by whole factors only; libjpeg refuses other layouts too.)
+#[test]
+fn every_layout_with_whole_ratios_keeps_its_blocks() {
+    const FACTORS: [(u8, u8); 8] =
+        [(1, 1), (1, 2), (2, 1), (2, 2), (1, 4), (4, 1), (2, 4), (4, 4)];
+    let mut all = Vec::new();
+    for a in FACTORS {
+        for b in FACTORS {
+            for c in FACTORS {
+                let factors = [a, b, c];
+                for coding in CODINGS {
+                    let data = frame(37, 23, factors, coding).encode();
+                    let what = format!("{factors:?} {coding:?}");
+                    match decode(&data, ColorSpace::RGB, true, true, true) {
+                        Ok(samples) => {
+                            if let Some(wrong) = first_wrong(&samples, 3, 37, 23, factors) {
+                                all.push(format!("{what}: {wrong}"));
+                            }
+                        }
+                        Err(e) => all.push(format!("{what}: {e}"))
+                    }
+                }
+            }
+        }
+    }
+    assert!(all.is_empty(), "{} failures:\n{}", all.len(), all.join("\n"));
+}

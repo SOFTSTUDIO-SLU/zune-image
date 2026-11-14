@@ -261,6 +261,10 @@ fn estimate_bounds_the_peak() {
         &[(1, 2), (1, 1), (2, 1)],
         &[(1, 1), (2, 2), (1, 1)],
         &[(2, 1), (1, 2), (1, 1)],
+        // A vertical factor above 2, or of 2 under a first component of 1: a larger
+        // upsampling buffer.
+        &[(1, 1), (1, 2), (4, 1)],
+        &[(4, 4), (1, 4), (1, 1)],
         &[(1, 1), (1, 1), (1, 1), (1, 1)],
         &[(2, 2), (1, 1), (1, 1), (2, 2)]
     ];

@@ -567,7 +567,7 @@ where
                 let sample = (h_max / (h * h_scale)).max(1) * (v_max / (v * v_scale)).max(1);
                 // `row` and `row_up`, `first_row_upsample_dest`, and `upsample_dest`, which
                 // `worker.rs` may grow to twice `raw_coeff`.
-                let upsample_dest = (stride * sample * 2 * 8 * v_scale).max(2 * raw);
+                let upsample_dest = (stride * sample * v.max(2) * 8 * v_scale).max(2 * raw);
                 rows = rows
                     .saturating_add(2 * stride * v)
                     .saturating_add(stride * v * sample)

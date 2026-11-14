@@ -199,11 +199,14 @@ impl Components {
         self.row_up = vec![0; self.width_stride * self.vertical_sample];
         self.first_row_upsample_dest =
             vec![128; self.vertical_sample * self.width_stride * self.sample_ratio.sample()];
+        // One MCU row of the component, `vertical_sample` block rows (`raw_coeff`), upsampled:
+        // the `fix_an_annoying_bug` factor alone was too small for a component with a vertical
+        // factor above 2, or of 2 in a frame whose first component has a vertical factor of 1.
         self.upsample_dest = vec![
             0;
             self.width_stride
                 * self.sample_ratio.sample()
-                * self.fix_an_annoying_bug
+                * self.fix_an_annoying_bug.max(self.vertical_sample)
                 * 8
                 * self.idct_v_scale
         ];
