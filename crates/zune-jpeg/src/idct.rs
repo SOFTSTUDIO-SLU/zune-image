@@ -47,6 +47,22 @@ pub mod neon;
 pub mod scalar;
 pub mod scaled;
 
+/// The block an inverse DCT writes from the start of `out`: 8 × `v_scale` rows `stride` apart,
+/// 8 × `h_scale` samples each (`h_scale` and `v_scale` are 1 or 2), or `None` if `out` is too
+/// short for it. Every inverse DCT indexes its output with checks, so a caller that takes its
+/// output from here returns an error for a block outside the buffer instead of panicking.
+pub(crate) fn idct_block(
+    out: &mut [i16], stride: usize, h_scale: usize, v_scale: usize
+) -> Option<&mut [i16]> {
+    let rows = 8 * v_scale;
+    let width = 8 * h_scale;
+    if stride < width {
+        return None;
+    }
+    let len = (rows - 1) * stride + width;
+    out.get_mut(..len)
+}
+
 /// Choose an appropriate IDCT function
 #[allow(unused_variables)]
 pub fn choose_idct_func(options: &DecoderOptions) -> IDCTPtr {
@@ -202,6 +218,44 @@ mod tests {
         for (wnd, name) in color.windows(2).zip(&dct_names) {
             let [a, b] = wnd else { unreachable!() };
             assert_eq!(a, b, "{name}");
+        }
+    }
+
+    #[test]
+    fn idct_block_is_the_whole_block_or_none() {
+        // 8 rows of 8 samples, 16 apart: the last row starts at 7 * 16.
+        let mut out = vec![0i16; 7 * 16 + 8];
+        assert_eq!(idct_block(&mut out, 16, 1, 1).map(|b| b.len()), Some(7 * 16 + 8));
+        assert!(idct_block(&mut out[1..], 16, 1, 1).is_none());
+        // Rows narrower than the block would overlap.
+        assert!(idct_block(&mut out, 4, 1, 1).is_none());
+        // An upsampling inverse DCT writes 16 rows of 16 samples.
+        let mut out = vec![0i16; 15 * 32 + 16];
+        assert!(idct_block(&mut out, 32, 2, 2).is_some());
+        assert!(idct_block(&mut out[..15 * 32 + 15], 32, 2, 2).is_none());
+        assert!(idct_block(&mut out, 8, 2, 1).is_none());
+        // Every inverse DCT stays inside the block it is given.
+        for (h, v) in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+            let stride = 8 * h + 3;
+            let mut out = vec![0i16; (8 * v - 1) * stride + 8 * h];
+            let block = idct_block(&mut out, stride, h, v).unwrap();
+            // Only the first 4 x 4 coefficients are non-zero, as the 4 x 4 inverse DCT needs.
+            let mut coefficients = [0i32; 64];
+            for i in (0..32).filter(|i| i % 8 < 4) {
+                coefficients[i] = 3;
+            }
+            if h * v > 1 {
+                scaled::idct_scaled(&coefficients, block, stride, h, v);
+            } else {
+                for idct in [
+                    choose_idct_func(&DecoderOptions::new_safe()),
+                    choose_idct_func(&DecoderOptions::new_fast()),
+                    choose_idct_4x4_func(&DecoderOptions::new_fast()),
+                    choose_idct_1x1_func(&DecoderOptions::new_fast())
+                ] {
+                    idct(&mut coefficients, block, stride);
+                }
+            }
         }
     }
 }

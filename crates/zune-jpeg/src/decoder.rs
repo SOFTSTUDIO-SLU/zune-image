@@ -412,6 +412,19 @@ where
             && self.options.jpeg_get_out_colorspace().num_components() > 1
     }
 
+    /// Whether a grey output of this colour frame upsamples its first component, as a colour
+    /// output does. The grey output is the first component's plane; the decoder's shortcut for
+    /// it takes that component's samples as they are, which is right only when the component
+    /// has the frame's largest sampling factors, and any component may have smaller ones
+    /// (ITU-T T.81 A.1.1).
+    pub(crate) fn grey_upsamples_first(&self) -> bool {
+        self.is_interleaved
+            && self.components.len() > 1
+            && self.options.jpeg_get_out_colorspace() == ColorSpace::Luma
+            && (self.components[0].horizontal_sample != self.h_max
+                || self.components[0].vertical_sample != self.v_max)
+    }
+
     /// The factors by which the inverse DCT upsamples a component with sampling factors `h`
     /// and `v` in a frame whose largest factors are `h_max` and `v_max`: 2 in a direction
     /// whose subsampling factor is even (libjpeg's rule, at most 2), otherwise 1.

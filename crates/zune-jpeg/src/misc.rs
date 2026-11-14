@@ -288,24 +288,28 @@ pub(crate) fn setup_component_params<T: ZByteReaderTrait>(
 
     settle_input_colorspace(img)?;
 
-    for component in &mut img.components {
-        // compute interleaved image info
+    // The MCU is sized by the largest factors over all components, whichever component has
+    // them (ITU-T T.81 A.1.1), so take the maxima before any stride or MCU count is set.
+    for component in &img.components {
         // h_max contains the maximum horizontal component
         img.h_max = max(img.h_max, component.horizontal_sample);
         // v_max contains the maximum vertical component
         img.v_max = max(img.v_max, component.vertical_sample);
-        img.mcu_width = img.h_max * 8;
-        img.mcu_height = img.v_max * 8;
-        // Number of MCU's per width
-        img.mcu_x = usize::from(img.info.width).div_ceil(img.mcu_width);
-        // Number of MCU's per height
-        img.mcu_y = usize::from(img.info.height).div_ceil(img.mcu_height);
+    }
+    img.mcu_width = img.h_max * 8;
+    img.mcu_height = img.v_max * 8;
+    // Number of MCU's per width
+    img.mcu_x = usize::from(img.info.width).div_ceil(img.mcu_width);
+    // Number of MCU's per height
+    img.mcu_y = usize::from(img.info.height).div_ceil(img.mcu_height);
 
-        if img.h_max != 1 || img.v_max != 1 {
-            // interleaved images have horizontal and vertical sampling factors
-            // not equal to 1.
-            img.is_interleaved = true;
-        }
+    if img.h_max != 1 || img.v_max != 1 {
+        // interleaved images have horizontal and vertical sampling factors
+        // not equal to 1.
+        img.is_interleaved = true;
+    }
+
+    for component in &mut img.components {
         // Extract quantization tables from the arrays into components
         let qt_table = *img.qt_tables[component.quantization_table_number as usize]
             .as_ref()

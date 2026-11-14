@@ -19,6 +19,7 @@ use crate::bitstream::BitStream;
 use crate::components::SampleRatios;
 use crate::decoder::MAX_COMPONENTS;
 use crate::errors::DecodeErrors;
+use crate::idct::idct_block;
 use crate::idct::scaled::idct_scaled;
 use crate::marker::Marker;
 use crate::mcu_prog::get_marker;
@@ -118,6 +119,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             && self.options.jpeg_get_out_colorspace().num_components() == 1
             && (self.info.sample_ratio == SampleRatios::V
                 || self.info.sample_ratio == SampleRatios::HV)
+            && !self.grey_upsamples_first()
         {
             // For a specific set of images, e.g interleaved,
             // when converting from YcbCr to grayscale, we need to
@@ -357,7 +359,15 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
         // Size of our output image(width*height)
         let is_hv = usize::from(self.is_interleaved);
-        let upsampler_scratch_size = is_hv * self.components[0].width_stride;
+        // The upsampler's scratch row is sized by the widest component, which need not be the
+        // first (the decoding of a frame in one scan sizes it the same way).
+        let widest = self
+            .components
+            .iter()
+            .map(|x| x.width_stride)
+            .max()
+            .unwrap_or(0);
+        let upsampler_scratch_size = is_hv * widest * 8;
         let width = usize::from(self.info.width);
         let padded_width = calculate_padded_width(width, self.info.sample_ratio);
 
@@ -641,7 +651,14 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                                 component.width_stride * c2 + c3
                             };
 
-                            let idct_pos = channel.get_mut(idct_position..).unwrap();
+                            let idct_pos = channel
+                                .get_mut(idct_position..)
+                                .and_then(|out| {
+                                    idct_block(out, component.width_stride, h_scale, v_scale)
+                                })
+                                .ok_or(DecodeErrors::FormatStatic(
+                                    "A block lies outside its component's buffer"
+                                ))?;
 
                             if h_scale * v_scale > 1 {
                                 idct_scaled(tmp, idct_pos, component.width_stride, h_scale, v_scale);
@@ -946,10 +963,15 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 Ok(())
             };
 
+        let upsampled = self.is_interleaved
+            && (self.options.jpeg_get_out_colorspace() != ColorSpace::Luma
+                || self.grey_upsamples_first());
         let comps = &mut self.components[..];
 
-        if self.is_interleaved && self.options.jpeg_get_out_colorspace() != ColorSpace::Luma {
-            for comp in comps.iter_mut() {
+        if upsampled {
+            // Only the components the output needs have samples (all of them for a colour
+            // output; the first for a grey one).
+            for comp in comps.iter_mut().filter(|c| c.needed) {
                 upsample(
                     comp,
                     mcu_height,
@@ -991,7 +1013,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 //
                 // E.g the Y sample is not sampled but we haven't finished upsampling the last row of
                 // the previous mcu, since we don't have the down row, so save it
-                for component in comps.iter_mut() {
+                for component in comps.iter_mut().filter(|c| c.needed) {
                     if component.sample_ratio != SampleRatios::H {
                         // We don't care about H sampling factors, since it's copied in the workers function
 
